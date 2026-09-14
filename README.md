@@ -124,3 +124,7 @@ or run it in a terminal.
 - On a PlayFab/crossplay server a disconnect (clean or timeout) shows up as the
   `Destroying abandoned … owner <id>` line; the monitor emits one logout per player.
 - If the server restarts, the log is truncated and the monitor resets automatically.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
