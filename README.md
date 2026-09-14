@@ -13,10 +13,10 @@ Vanilla Valheim already prints everything needed to `valheim_console.log`
 
 | Event   | Log line |
 |---------|----------|
-| Login   | `Got character ZDOID from Hue Ap Sior : 3738881258:67` (first non-zero ZDOID for a name) |
-| Death   | `Got character ZDOID from Hue Ap Sior : 0:0` |
+| Login   | `Got character ZDOID from Bjorn : 1234567890:67` (first non-zero ZDOID for a name) |
+| Death   | `Got character ZDOID from Bjorn : 0:0` |
 | Respawn | next non-zero ZDOID for that name |
-| Logout  | `Destroying abandoned non persistent zdo … owner 3738881258` (owner id matches the player), or `Closing socket …` on direct-Steam servers, or `Player disconnected … now 0 player(s)` |
+| Logout  | `Destroying abandoned non persistent zdo … owner 1234567890` (owner id matches the player), or `Closing socket …` on direct-Steam servers, or `Player disconnected … now 0 player(s)` |
 
 The monitor tails the log (by byte offset, so restarts never re-post), runs the
 lines through a small state machine, and posts an embed to a Discord webhook.
@@ -66,11 +66,11 @@ The panel's Console tab reads
 with an Auth0 bearer token. The `nexus` source polls that endpoint and
 de-duplicates by line overlap. Your server id is the UUID in the panel URL.
 
-The catch: the token is the panel's own short-lived access token (you can copy
-it from your browser's dev tools → Network → any `api.prod.nexus.low.ms`
-request → `Authorization` header). It expires, so this source is fine for
-testing but needs a token refresh to run unattended. If LOW.MS adds API keys,
-paste one here instead.
+The catch: this is the panel's *internal* endpoint and only accepts the
+panel's own short-lived Auth0 session token, not the `lowms_…` API keys from
+the public API (those return "Invalid token" here, and the public v1 API has no
+console-read endpoint as of Sept 2026). It's fine for testing with a token
+copied from your browser's dev tools, but not for running unattended.
 
 ### `file`
 For running the monitor on the same machine as the server, or on any log
