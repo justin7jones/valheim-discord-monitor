@@ -1,0 +1,33 @@
+09/14/2026 07:30:48: World save (5/5) done. Total time [108ms]
+09/14/2026 07:37:08: Update PlayFab entity token
+09/14/2026 07:40:51:  Connections 0 ZDOS:145887  sent:0 recv:0
+09/14/2026 07:44:34: PlayFab listen socket child connected to remote player E15BFD931510F277
+09/14/2026 07:44:34: Player joined server "virtualtabletops" that has join code 034505, now 1 player(s)
+09/14/2026 07:44:34: ZRpc timeout set to 90s
+09/14/2026 07:44:34: Muted PlayFab remote player E15BFD931510F277
+09/14/2026 07:44:34: PlayFab socket with remote ID playfab/E15BFD931510F277 received local Platform ID Steam_76561198018506450
+09/14/2026 07:44:34: Got handshake from client playfab/E15BFD931510F277
+09/14/2026 07:44:38: Network version check, their:40, mine:40
+09/14/2026 07:44:38: Server: New peer connected,sending global keys
+09/14/2026 07:45:02: Got character ZDOID from Hue Ap Sior : 3738881258:67
+09/14/2026 07:50:00: PlayFab listen socket child connected to remote player AAAA1111BBBB2222
+09/14/2026 07:50:00: Player joined server "virtualtabletops" that has join code 034505, now 2 player(s)
+09/14/2026 07:50:20: Got character ZDOID from Thorvald the Bold : 1122334455:1
+09/14/2026 07:54:21: Got character ZDOID from Hue Ap Sior : 0:0
+09/14/2026 07:54:30: Got character ZDOID from Hue Ap Sior : 3738881258:1112
+09/14/2026 08:39:29: ZRpc timeout detected
+ZPlayFabSocket::Dispose. State: CONNECTED
+ZPlayFabSocket::Dispose. leave lobby. LobbyId:
+09/14/2026 08:39:29: Destroying abandoned non persistent zdo 3738881258:1112 owner 3738881258
+09/14/2026 08:39:29: Destroying abandoned non persistent zdo 3738881258:7583 owner 3738881258
+09/14/2026 08:39:29: Destroying abandoned non persistent zdo 3738881258:7582 owner 3738881258
+ZPlayFabSocket::Dispose. State: CLOSED
+09/14/2026 08:40:51:  Connections 1 ZDOS:147155  sent:0 recv:0
+09/14/2026 08:45:00: Player disconnected from server "virtualtabletops" that has join code 034505, now 0 player(s)
+09/14/2026 08:45:00: Destroying abandoned non persistent zdo 1122334455:9 owner 1122334455
+09/14/2026 08:53:35: PlayFab listen socket child connected to remote player E15BFD931510F277
+09/14/2026 08:53:35: Player joined server "virtualtabletops" that has join code 034505, now 1 player(s)
+09/14/2026 08:54:03: Got character ZDOID from Hue Ap Sior : 3641457403:1
+09/14/2026 09:06:41: ZRpc timeout detected
+09/14/2026 09:06:41: Destroying abandoned non persistent zdo 3641457403:2299 owner 3641457403
+09/14/2026 09:06:41: Destroying abandoned non persistent zdo 3641457403:1 owner 3641457403

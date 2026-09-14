@@ -1,0 +1,57 @@
+{
+  "server_name": "virtualtabletops",
+  "poll_interval_seconds": 10,
+  "state_file": "monitor_state.json",
+  "events": ["login", "logout", "death"],
+
+  "discord": {
+    "webhook_url": "https://discord.com/api/webhooks/XXXX/YYYY",
+    "username": "Valheim",
+    "embeds": true,
+    "show_player_count": true,
+    "messages": {
+      "login": "**{player}** has arrived in {server}.",
+      "logout": "**{player}** has left {server}.",
+      "death": "**{player}** has died. Odin is watching.",
+      "respawn": "**{player}** has respawned.",
+      "server_up": "{server} is online."
+    }
+  },
+
+  "source": {
+    "type": "ftp",
+    "host": "51.81.167.39",
+    "port": 21,
+    "user": "your-low.ms-login",
+    "password": "your-low.ms-password",
+    "path": "/game/valheim_console.log",
+    "tls": false,
+    "passive": true
+  },
+
+  "_alternative_sources": {
+    "nexus": {
+      "type": "nexus",
+      "server_id": "4172733f-5e43-4663-b627-fd7405f0feb1",
+      "token": "PASTE-BEARER-TOKEN-OR-USE-NEXUS_TOKEN-ENV",
+      "lines": 300
+    },
+    "file": {
+      "type": "file",
+      "path": "/path/to/valheim_console.log"
+    },
+    "sftp": {
+      "type": "sftp",
+      "host": "51.81.167.39",
+      "port": 22,
+      "user": "user",
+      "password": "password",
+      "path": "/game/valheim_console.log"
+    },
+    "http": {
+      "type": "http",
+      "url": "https://example.com/valheim_console.log",
+      "headers": {"Authorization": "Bearer ..."}
+    }
+  }
+}
