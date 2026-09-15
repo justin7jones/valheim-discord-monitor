@@ -53,8 +53,11 @@
     "nexus": {
       "type": "nexus",
       "server_id": "YOUR-SERVER-UUID",
-      "token": "PASTE-BEARER-TOKEN-OR-USE-NEXUS_TOKEN-ENV",
-      "lines": 300
+      "lines": 300,
+      "login": {
+        "email": "you@example.com  (or NEXUS_EMAIL env)",
+        "password": "your-panel-password  (or NEXUS_PASSWORD env)"
+      }
     },
     "file": {
       "type": "file",
@@ -75,5 +78,10 @@
         "Authorization": "Bearer ..."
       }
     }
-  }
+  },
+  "_log_mode_events": [
+    "login",
+    "logout",
+    "death"
+  ]
 }

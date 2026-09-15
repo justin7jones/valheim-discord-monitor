@@ -394,21 +394,41 @@ class NexusConsoleSource:
     LOW.MS 'Nexus' panel console endpoint:
         GET https://api.prod.nexus.low.ms/user/servers/<server_id>/daemon/console?lines=N
         Authorization: Bearer <token>
-    Returns the last N console lines. The token is the short-lived Auth0 access
-    token the panel itself uses (see README). This is a line-window source.
+    Returns the last N console lines ({"lines": [...]}). The token is the short-lived
+    Auth0 session token the panel itself uses. Supply it directly (`token`) for a
+    quick test, or give `token_cache` (nexus_login.TokenCache) so the monitor signs
+    in with your panel account and renews the token itself. Line-window source.
     """
 
-    def __init__(self, server_id: str, token: str, lines: int = 300,
-                 base_url: str = "https://api.prod.nexus.low.ms"):
+    def __init__(self, server_id: str, token: Optional[str] = None, lines: int = 300,
+                 base_url: str = "https://api.prod.nexus.low.ms", token_cache=None):
         self.url = f"{base_url}/user/servers/{server_id}/daemon/console?lines={lines}"
         self.token = token
+        self.token_cache = token_cache
 
-    def fetch_lines(self) -> list[str]:
-        req = urllib.request.Request(self.url, headers={"Authorization": f"Bearer {self.token}",
+    def _token(self) -> str:
+        if self.token_cache is not None:
+            return self.token_cache.get()
+        if not self.token:
+            raise RuntimeError("nexus source needs a token or login credentials")
+        return self.token
+
+    def _get(self) -> tuple[str, str]:
+        req = urllib.request.Request(self.url, headers={"Authorization": f"Bearer {self._token()}",
                                                         "Accept": "application/json, text/plain"})
         with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read().decode("utf-8", errors="replace")
-            ctype = r.headers.get("Content-Type", "")
+            return r.read().decode("utf-8", errors="replace"), r.headers.get("Content-Type", "")
+
+    def fetch_lines(self) -> list[str]:
+        try:
+            raw, ctype = self._get()
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and self.token_cache is not None:
+                log.info("Panel token rejected (%s); signing in again", e.code)
+                self.token_cache.invalidate()
+                raw, ctype = self._get()
+            else:
+                raise
         if "json" in ctype:
             data = json.loads(raw)
             # Accept a few plausible shapes: ["line", ...], {"lines": [...]}, {"data": [...]}, {"data": {"lines": [...]}}
@@ -600,8 +620,20 @@ def build_source(cfg: dict):
     if t == "http":
         return HTTPSource(src["url"], src.get("headers"))
     if t == "nexus":
-        return NexusConsoleSource(src["server_id"], src["token"], int(src.get("lines", 300)),
-                                  src.get("base_url", "https://api.prod.nexus.low.ms"))
+        cache = None
+        login = dict(src.get("login") or {})
+        login["email"] = os.environ.get("NEXUS_EMAIL", login.get("email"))
+        login["password"] = os.environ.get("NEXUS_PASSWORD", login.get("password"))
+        if login.get("email") and login.get("password"):
+            from nexus_login import TokenCache
+            cache = TokenCache(src["server_id"], login["email"], login["password"],
+                               selectors=login.get("selectors"), headless=not login.get("headed", False),
+                               login_timeout=float(login.get("timeout", 90)))
+        token = src.get("token") or None
+        if token and token.startswith("PASTE"):
+            token = None
+        return NexusConsoleSource(src["server_id"], token, int(src.get("lines", 300)),
+                                  src.get("base_url", "https://api.prod.nexus.low.ms"), token_cache=cache)
     if t == "a2s":
         return A2SSource(src["host"], int(src.get("port", 2457)), float(src.get("timeout", 3.0)),
                          int(src.get("offline_after", 3)))
@@ -707,6 +739,8 @@ def main():
     else:
         tailer = OffsetTailer(source, cfg.get("state_file", "monitor_state.json"), start_at_end=not args.from_start)
     parser = ValheimLogParser()
+    log_events = {"login", "logout", "death", "respawn", "server_up"}
+    events = set(cfg.get("events") or ()) & log_events or {"login", "logout", "death"}
     log.info("Monitoring %s source for %s; posting %s every %.0fs", cfg["source"]["type"], server_name, sorted(events), interval)
 
     backoff = interval

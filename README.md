@@ -6,11 +6,13 @@ on the game server, so Steam achievements keep working. Two modes:
 | Mode | Needs | Events |
 |---|---|---|
 | **Count mode** (`a2s` or `steamapi`) | Only the server's IP — polls the Steam query port (game port + 1), or Steam's master server via the Web API when that port is firewalled | player joined / left (count only), server online / offline |
-| **Log mode** (`ftp`, `sftp`, `file`, `http`, `nexus`) | Read access to `valheim_console.log` | named **login**, **logout**, **death**, respawn |
+| **Log mode** (`nexus`, `ftp`, `sftp`, `file`, `http`) | Read access to `valheim_console.log` — on LOW.MS via the panel login (`nexus`) | named **login**, **logout**, **death**, respawn |
 
-Count mode works on any host, crossplay or not, and is the fallback when the
-host gives you no file access (LOW.MS's Nexus panel currently offers no FTP/SFTP
-and no console-read API). Log mode is richer if you can get at the log.
+Log mode is the one you want: names and deaths. On LOW.MS use the `nexus`
+source (no FTP/SFTP or console API exists there, but the monitor can sign in to
+the panel as you). Count mode is the fallback for hosts where nothing else
+works — note the Steam-based sources report a stale count on crossplay
+servers, because relayed players never register with Steam.
 
 Python 3.9+, no third-party packages (SFTP is the one optional extra).
 
@@ -55,7 +57,9 @@ Check it with `python valheim_discord_monitor.py --probe`. Steam refreshes
 its listing on the server's heartbeat, so counts can lag a minute or so.
 
 Limitations: A2S carries no names (Valheim returns an empty player list) and no
-death information. Two players swapping within one poll interval shows as no
+death information. **Crossplay servers:** both `a2s` and `steamapi` see only
+players who connected directly through Steam, so with crossplay on the count
+stays frozen — use the `nexus` source instead. Two players swapping within one poll interval shows as no
 change.
 
 ## Log mode
@@ -111,17 +115,42 @@ Set `"tls": true` if the host requires FTPS.
 LOW.MS's Nexus panel does not currently offer FTP/SFTP (confirmed with their
 support, Sept 2026) — use count mode there.
 
-#### `nexus` (LOW.MS panel API)
-The panel's Console tab reads
-`GET https://api.prod.nexus.low.ms/user/servers/<server_id>/daemon/console?lines=N`
-with an Auth0 bearer token. The `nexus` source polls that endpoint and
-de-duplicates by line overlap. Your server id is the UUID in the panel URL.
+#### `nexus` (LOW.MS panel — recommended on LOW.MS)
+The panel's Console tab reads the live log from
+`GET https://api.prod.nexus.low.ms/user/servers/<id>/daemon/console?lines=N`
+using the panel's own Auth0 session token (the public `lowms_…` API keys are
+rejected there, and the public API has no console-read endpoint). The `nexus`
+source signs in to the panel **with your own account** through a headless
+browser, captures that token, caches it, and signs in again whenever it
+expires or is rejected — so you get the full log, and with it named login /
+logout / death events, on a host that offers no file access.
 
-The catch: this is the panel's *internal* endpoint and only accepts the
-panel's own short-lived Auth0 session token, not the `lowms_…` API keys from
-the public API (those return "Invalid token" here, and the public v1 API has no
-console-read endpoint as of Sept 2026). It's fine for testing with a token
-copied from your browser's dev tools, but not for running unattended.
+One-time setup on the machine that runs the monitor:
+```bash
+pip install playwright
+python3 -m playwright install --with-deps chromium     # needs sudo for the system deps
+```
+Config:
+```json
+"source": {
+  "type": "nexus",
+  "server_id": "YOUR-SERVER-UUID",
+  "lines": 300,
+  "login": { "email": "you@example.com", "password": "…" }
+},
+"events": ["login", "logout", "death"]
+```
+Or keep the credentials out of the file with `NEXUS_EMAIL` / `NEXUS_PASSWORD`.
+The server id is the UUID in the panel URL. Check it works before starting
+the monitor:
+```bash
+NEXUS_EMAIL=… NEXUS_PASSWORD=… python3 nexus_login.py --server-id YOUR-SERVER-UUID --check
+```
+That signs in, prints the token expiry, and echoes three console lines. The
+token and browser profile live in `~/.valheim-monitor/`; on a login failure a
+screenshot and page HTML are dropped there for diagnosis. Two caveats: enabling
+MFA on the LOW.MS account will break the automatic sign-in, and this relies on
+an internal panel endpoint LOW.MS could change.
 
 #### `file`
 For running the monitor on the same machine as the server, or on any log
