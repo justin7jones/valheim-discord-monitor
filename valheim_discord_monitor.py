@@ -2,10 +2,14 @@
 """
 Valheim -> Discord event monitor (no mods required).
 
-Tails the vanilla Valheim dedicated-server console log (locally, over FTP/SFTP,
-via the LOW.MS panel API, or any HTTP endpoint that returns the raw log text),
-detects player login / logout / death events, and posts them to a Discord
-webhook.
+Two modes:
+
+  * Log mode  — tails the vanilla Valheim dedicated-server console log (locally,
+    over FTP/SFTP, via the LOW.MS panel API, or any HTTP endpoint that returns
+    the raw log text) and posts named login / logout / death events.
+  * Count mode (source type "a2s") — polls the server's Steam query port
+    (game port + 1) and posts when the player count changes or the server goes
+    down / comes back. Needs no file or panel access; no names or deaths.
 
 Only the Python standard library is required for file / ftp / http / nexus
 sources. SFTP needs `pip install paramiko`.
@@ -15,6 +19,7 @@ Usage:
     python valheim_discord_monitor.py --config config.json --discover     # list candidate log files on the FTP server
     python valheim_discord_monitor.py --config config.json --replay sample.log   # dry-run the parser on a file
     python valheim_discord_monitor.py --config config.json --test-webhook # send a test message to Discord
+    python a2s_probe.py YOUR.SERVER.IP                                    # check the Steam query port answers
 """
 
 from __future__ import annotations
@@ -156,14 +161,21 @@ class ValheimLogParser:
 # Discord webhook
 # ---------------------------------------------------------------------------
 class Discord:
-    COLORS = {"login": 0x57F287, "logout": 0x95A5A6, "death": 0xED4245, "respawn": 0xFEE75C, "server_up": 0x5865F2}
-    EMOJI = {"login": "🟢", "logout": "⚪", "death": "💀", "respawn": "🔥", "server_up": "🛡️"}
+    COLORS = {"login": 0x57F287, "logout": 0x95A5A6, "death": 0xED4245, "respawn": 0xFEE75C, "server_up": 0x5865F2,
+              "player_joined": 0x57F287, "player_left": 0x95A5A6, "server_online": 0x5865F2, "server_offline": 0xED4245}
+    EMOJI = {"login": "🟢", "logout": "⚪", "death": "💀", "respawn": "🔥", "server_up": "🛡️",
+             "player_joined": "🟢", "player_left": "⚪", "server_online": "🛡️", "server_offline": "🔴"}
     DEFAULT_MESSAGES = {
         "login": "**{player}** has arrived in {server}.",
         "logout": "**{player}** has left {server}.",
         "death": "**{player}** has died. Odin is watching.",
         "respawn": "**{player}** has respawned.",
         "server_up": "{server} is online.",
+        # Count-only events (a2s source): no names available.
+        "player_joined": "{who} arrived in {server}. **{count}/{max}** online.",
+        "player_left": "{who} left {server}. **{count}/{max}** online.",
+        "server_online": "{server} is back online. **{count}/{max}** online.",
+        "server_offline": "{server} is not responding — it may be down or restarting.",
     }
 
     def __init__(self, webhook_url: str, username: str = "Valheim", show_count: bool = True,
@@ -177,7 +189,8 @@ class Discord:
     def post(self, ev: Event, server_name: str, event_filter: set) -> None:
         if ev.kind not in event_filter or ev.kind not in self.messages:
             return
-        text = self.messages[ev.kind].format(player=ev.player, server=server_name, **ev.extra)
+        fields = {**ev.extra, "player": ev.player, "server": server_name or ev.extra.get("server", "the server")}
+        text = self.messages[ev.kind].format(**fields)
         emoji = self.EMOJI.get(ev.kind, "")
         footer = f"{ev.extra['count']} player(s) online" if self.show_count and "count" in ev.extra else None
         if self.use_embeds:
@@ -411,6 +424,54 @@ class NexusConsoleSource:
         return raw.splitlines()
 
 
+class A2SSource:
+    """
+    Steam server query (A2S_INFO) — works for any Valheim dedicated server, crossplay or not,
+    with no log or panel access. Valheim answers on the game port + 1 (default 2457).
+    Gives player COUNT only: names, logins and deaths are not available this way.
+    """
+
+    def __init__(self, host: str, port: int = 2457, timeout: float = 3.0, offline_after: int = 3):
+        from a2s_probe import a2s_info
+        self._query = a2s_info
+        self.host, self.port, self.timeout = host, port, timeout
+        self.offline_after = offline_after          # consecutive failed queries before "offline"
+        self.failures = 0
+        self.online: Optional[bool] = None          # None until the first successful/failed poll settles
+        self.players: Optional[int] = None
+        self.info: dict = {}
+
+    def poll(self) -> Iterator[Event]:
+        try:
+            info = self._query(self.host, self.port, self.timeout)
+        except Exception as e:
+            self.failures += 1
+            log.debug("A2S query failed (%d/%d): %s", self.failures, self.offline_after, e)
+            if self.failures >= self.offline_after and self.online is not False:
+                was_up = self.online
+                self.online = False
+                self.players = None
+                if was_up:                           # don't announce "offline" on a cold start
+                    yield Event("server_offline", None, {"server": self.info.get("name", "")})
+            return
+
+        self.failures = 0
+        self.info = info
+        count = info["players"]
+        first = self.online is None
+        if self.online is not True:
+            self.online = True
+            if not first:
+                yield Event("server_online", None, {"count": count, "max": info["max_players"], "server": info["name"]})
+        if self.players is not None and count != self.players:
+            kind = "player_joined" if count > self.players else "player_left"
+            delta = abs(count - self.players)
+            yield Event(kind, None, {"count": count, "max": info["max_players"], "delta": delta,
+                                     "who": "A viking" if delta == 1 else f"{delta} vikings",
+                                     "server": info["name"]})
+        self.players = count
+
+
 # ---------------------------------------------------------------------------
 # Tailers
 # ---------------------------------------------------------------------------
@@ -500,6 +561,9 @@ def build_source(cfg: dict):
     if t == "nexus":
         return NexusConsoleSource(src["server_id"], src["token"], int(src.get("lines", 300)),
                                   src.get("base_url", "https://api.prod.nexus.low.ms"))
+    if t == "a2s":
+        return A2SSource(src["host"], int(src.get("port", 2457)), float(src.get("timeout", 3.0)),
+                         int(src.get("offline_after", 3)))
     sys.exit(f"Unknown source type: {t}")
 
 
@@ -568,6 +632,25 @@ def main():
         sys.exit("No Discord webhook URL configured (config discord.webhook_url or DISCORD_WEBHOOK_URL)")
 
     interval = float(cfg.get("poll_interval_seconds", 10))
+
+    if isinstance(source, A2SSource):
+        # Count-only mode: no log parsing, just diff the player count each poll.
+        default_events = {"player_joined", "player_left", "server_online", "server_offline"}
+        events = set(cfg.get("events") or default_events) & default_events or default_events
+        log.info("Monitoring %s:%d via Steam query for %s; posting %s every %.0fs",
+                 source.host, source.port, server_name, sorted(events), interval)
+        while True:
+            try:
+                for ev in source.poll():
+                    log.info("EVENT %-14s %s", ev.kind, ev.extra)
+                    discord.post(ev, server_name or source.info.get("name", ""), events)
+            except KeyboardInterrupt:
+                log.info("Stopping")
+                return
+            except Exception as e:
+                log.warning("Poll failed: %s", e)
+            time.sleep(interval)
+
     if hasattr(source, "fetch_lines"):
         tailer = WindowTailer(source, start_at_end=not args.from_start)
     else:

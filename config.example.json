@@ -1,9 +1,13 @@
 {
   "server_name": "My Valheim Server",
-  "poll_interval_seconds": 10,
+  "poll_interval_seconds": 15,
   "state_file": "monitor_state.json",
-  "events": ["login", "logout", "death"],
-
+  "events": [
+    "player_joined",
+    "player_left",
+    "server_online",
+    "server_offline"
+  ],
   "discord": {
     "webhook_url": "https://discord.com/api/webhooks/XXXX/YYYY",
     "username": "Valheim",
@@ -14,22 +18,31 @@
       "logout": "**{player}** has left {server}.",
       "death": "**{player}** has died. Odin is watching.",
       "respawn": "**{player}** has respawned.",
-      "server_up": "{server} is online."
+      "server_up": "{server} is online.",
+      "player_joined": "{who} arrived in {server}. **{count}/{max}** online.",
+      "player_left": "{who} left {server}. **{count}/{max}** online.",
+      "server_online": "{server} is back online. **{count}/{max}** online.",
+      "server_offline": "{server} is not responding — it may be down or restarting."
     }
   },
-
   "source": {
-    "type": "ftp",
+    "type": "a2s",
     "host": "YOUR.SERVER.IP",
-    "port": 21,
-    "user": "your-low.ms-login",
-    "password": "your-low.ms-password",
-    "path": "/game/valheim_console.log",
-    "tls": false,
-    "passive": true
+    "port": 2457,
+    "timeout": 3,
+    "offline_after": 3
   },
-
   "_alternative_sources": {
+    "ftp": {
+      "type": "ftp",
+      "host": "YOUR.SERVER.IP",
+      "port": 21,
+      "user": "your-low.ms-login",
+      "password": "your-low.ms-password",
+      "path": "/game/valheim_console.log",
+      "tls": false,
+      "passive": true
+    },
     "nexus": {
       "type": "nexus",
       "server_id": "YOUR-SERVER-UUID",
@@ -51,7 +64,9 @@
     "http": {
       "type": "http",
       "url": "https://example.com/valheim_console.log",
-      "headers": {"Authorization": "Bearer ..."}
+      "headers": {
+        "Authorization": "Bearer ..."
+      }
     }
   }
 }

@@ -1,12 +1,43 @@
 # Valheim → Discord monitor (no mods)
 
-Watches the vanilla Valheim dedicated-server console log and posts **login**,
-**logout** and **death** events to a Discord channel. Nothing is installed on
-the game server, so Steam achievements keep working.
+Posts Valheim server activity to a Discord channel without installing anything
+on the game server, so Steam achievements keep working. Two modes:
 
-Single Python 3.9+ file, no third-party packages (SFTP is the one optional extra).
+| Mode | Needs | Events |
+|---|---|---|
+| **Count mode** (`a2s`) | Only the server's IP — polls the Steam query port (game port + 1) | player joined / left (count only), server online / offline |
+| **Log mode** (`ftp`, `sftp`, `file`, `http`, `nexus`) | Read access to `valheim_console.log` | named **login**, **logout**, **death**, respawn |
 
-## How it works
+Count mode works on any host, crossplay or not, and is the fallback when the
+host gives you no file access (LOW.MS's Nexus panel currently offers no FTP/SFTP
+and no console-read API). Log mode is richer if you can get at the log.
+
+Python 3.9+, no third-party packages (SFTP is the one optional extra).
+
+## Count mode (quick start)
+
+1. Check the query port answers from wherever the monitor will run:
+   ```bash
+   python a2s_probe.py YOUR.SERVER.IP          # prints "name — 2/10 players (v0.220.5 …)"
+   ```
+   Valheim's query port is the game port + 1 (2456 → 2457). If you get no
+   reply, the host may block UDP queries — ask them to open it.
+2. Create a Discord webhook (channel → Edit Channel → Integrations → Webhooks).
+3. `cp config.example.json config.json`, fill in `host` and `webhook_url`.
+4. `python valheim_discord_monitor.py --test-webhook`, then
+   `python valheim_discord_monitor.py`.
+
+The monitor polls every `poll_interval_seconds` (15 s default), posts when the
+count changes, and marks the server offline after `offline_after` consecutive
+failed queries (3 default) so a single dropped packet doesn't cause a false
+alarm. Nothing is posted on start-up. Messages use `{who}` ("A viking" / "2
+vikings"), `{count}`, `{max}` and `{server}` placeholders.
+
+Limitations: A2S carries no names (Valheim returns an empty player list) and no
+death information. Two players swapping within one poll interval shows as no
+change.
+
+## Log mode
 
 Vanilla Valheim already prints everything needed to `valheim_console.log`
 (on LOW.MS: **Files → game → valheim_console.log**). From your server:
@@ -21,7 +52,7 @@ Vanilla Valheim already prints everything needed to `valheim_console.log`
 The monitor tails the log (by byte offset, so restarts never re-post), runs the
 lines through a small state machine, and posts an embed to a Discord webhook.
 
-## Setup
+### Setup
 
 1. **Discord webhook** — in your Discord server: channel → Edit Channel →
    Integrations → Webhooks → New Webhook → Copy Webhook URL.
@@ -43,12 +74,12 @@ lines through a small state machine, and posts an embed to a Discord webhook.
 By default the monitor starts at the **end** of the log (only new events post).
 Use `--from-start` once if you want it to replay the existing file.
 
-## Log sources
+### Log sources
 
-### `ftp` (recommended for LOW.MS)
-LOW.MS documents FTP access using your panel login. Set `host` to your
-server IP, `path` to `/game/valheim_console.log` (the folder layout may put it
-under a `<ip>_<port>/` directory — run discovery to find out):
+#### `ftp`
+For hosts that offer FTP. Set `host`, and `path` to the console log (on
+LOW.MS it is `game/valheim_console.log`; the layout may put it under a
+`<ip>_<port>/` directory — run discovery to find out):
 
 ```bash
 python valheim_discord_monitor.py --config config.json --discover
@@ -56,11 +87,10 @@ python valheim_discord_monitor.py --config config.json --discover
 This walks the FTP tree and prints every `*.log` / `*console*` file with its size.
 Set `"tls": true` if the host requires FTPS.
 
-If FTP turns out not to be enabled on the new Nexus panel, ask LOW.MS support
-to enable FTP/SFTP for your server — it's the cleanest option — or use one of
-the sources below.
+LOW.MS's Nexus panel does not currently offer FTP/SFTP (confirmed with their
+support, Sept 2026) — use count mode there.
 
-### `nexus` (LOW.MS panel API)
+#### `nexus` (LOW.MS panel API)
 The panel's Console tab reads
 `GET https://api.prod.nexus.low.ms/user/servers/<server_id>/daemon/console?lines=N`
 with an Auth0 bearer token. The `nexus` source polls that endpoint and
@@ -72,11 +102,11 @@ the public API (those return "Invalid token" here, and the public v1 API has no
 console-read endpoint as of Sept 2026). It's fine for testing with a token
 copied from your browser's dev tools, but not for running unattended.
 
-### `file`
+#### `file`
 For running the monitor on the same machine as the server, or on any log
 file you sync locally.
 
-### `sftp` / `http`
+#### `sftp` / `http`
 SFTP needs `pip install paramiko`. `http` polls any URL that returns the raw
 log text (supports `Range` requests if the server does).
 
@@ -112,11 +142,12 @@ or run it in a terminal.
 
 | Config key | Default | Meaning |
 |---|---|---|
-| `events` | `["login","logout","death"]` | Which events to post. Also available: `respawn`, `server_up`. |
-| `poll_interval_seconds` | 10 | How often to check the log. |
+| `events` | mode default | Log mode: `login`, `logout`, `death`, `respawn`, `server_up`. Count mode: `player_joined`, `player_left`, `server_online`, `server_offline`. |
+| `poll_interval_seconds` | 15 | How often to poll. |
+| `source.offline_after` | 3 | Count mode: failed queries in a row before "offline". |
 | `discord.embeds` | true | Coloured embed vs plain text. |
 | `discord.show_player_count` | true | Footer with the current online count. |
-| `discord.messages` | see example | Per-event templates; `{player}` and `{server}` placeholders. |
+| `discord.messages` | see example | Per-event templates; `{player}`, `{server}`, `{who}`, `{count}`, `{max}` placeholders. |
 | `state_file` | `monitor_state.json` | Where the read offset is remembered. |
 
 ## Notes
