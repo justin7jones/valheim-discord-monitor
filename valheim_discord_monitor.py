@@ -7,9 +7,11 @@ Two modes:
   * Log mode  — tails the vanilla Valheim dedicated-server console log (locally,
     over FTP/SFTP, via the LOW.MS panel API, or any HTTP endpoint that returns
     the raw log text) and posts named login / logout / death events.
-  * Count mode (source type "a2s") — polls the server's Steam query port
-    (game port + 1) and posts when the player count changes or the server goes
-    down / comes back. Needs no file or panel access; no names or deaths.
+  * Count mode (source type "a2s" or "steamapi") — polls the server's Steam
+    query port (game port + 1), or Steam's master server via the Web API when
+    that port is firewalled, and posts when the player count changes or the
+    server goes down / comes back. Needs no file or panel access; no names or
+    deaths.
 
 Only the Python standard library is required for file / ftp / http / nexus
 sources. SFTP needs `pip install paramiko`.
@@ -34,6 +36,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -432,8 +435,6 @@ class A2SSource:
     """
 
     def __init__(self, host: str, port: int = 2457, timeout: float = 3.0, offline_after: int = 3):
-        from a2s_probe import a2s_info
-        self._query = a2s_info
         self.host, self.port, self.timeout = host, port, timeout
         self.offline_after = offline_after          # consecutive failed queries before "offline"
         self.failures = 0
@@ -443,7 +444,7 @@ class A2SSource:
 
     def poll(self) -> Iterator[Event]:
         try:
-            info = self._query(self.host, self.port, self.timeout)
+            info = self._query()
         except Exception as e:
             self.failures += 1
             log.debug("A2S query failed (%d/%d): %s", self.failures, self.offline_after, e)
@@ -470,6 +471,46 @@ class A2SSource:
                                      "who": "A viking" if delta == 1 else f"{delta} vikings",
                                      "server": info["name"]})
         self.players = count
+
+
+    def _query(self) -> dict:
+        from a2s_probe import a2s_info
+        return a2s_info(self.host, self.port, self.timeout)
+
+
+class SteamWebAPISource(A2SSource):
+    """
+    Same count-only events as A2SSource, but read from Steam's master server via the
+    Web API instead of querying the game server directly. The game server heartbeats
+    its player count to Steam OUTBOUND, so this works even when the host firewalls the
+    query port. Requirements: the server is set Public (listed in the community
+    browser) and a free Steam Web API key (https://steamcommunity.com/dev/apikey).
+    """
+
+    APP_ID = 892970  # Valheim
+
+    def __init__(self, host: str, api_key: str, game_port: int = 2456, timeout: float = 10.0, offline_after: int = 3):
+        super().__init__(host, game_port, timeout, offline_after)
+        self.api_key = api_key
+
+    def _query(self) -> dict:
+        import socket
+        ip = socket.gethostbyname(self.host)
+        flt = f"\\appid\\{self.APP_ID}\\addr\\{ip}"
+        url = ("https://api.steampowered.com/IGameServersService/GetServerList/v1/?"
+               + urllib.parse.urlencode({"key": self.api_key, "filter": flt, "limit": 20}))
+        req = urllib.request.Request(url, headers={"User-Agent": "valheim-discord-monitor/1.0"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            data = json.load(r)
+        servers = data.get("response", {}).get("servers", [])
+        match = [x for x in servers if int(x.get("gameport", 0)) == self.port] or servers
+        if not match:
+            raise LookupError(f"Steam master server has no entry for {ip}:{self.port} "
+                              "(is the server set Public, and has it been up for a minute?)")
+        x = match[0]
+        return {"name": x.get("name", ""), "players": int(x.get("players", 0)),
+                "max_players": int(x.get("max_players", 0)), "version": x.get("version", ""),
+                "password": None, "map": x.get("map", "")}
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +605,9 @@ def build_source(cfg: dict):
     if t == "a2s":
         return A2SSource(src["host"], int(src.get("port", 2457)), float(src.get("timeout", 3.0)),
                          int(src.get("offline_after", 3)))
+    if t == "steamapi":
+        return SteamWebAPISource(src["host"], src["api_key"], int(src.get("game_port", 2456)),
+                                 float(src.get("timeout", 10.0)), int(src.get("offline_after", 3)))
     sys.exit(f"Unknown source type: {t}")
 
 
@@ -576,7 +620,8 @@ def load_config(path: str) -> dict:
     for env, section, key in (("DISCORD_WEBHOOK_URL", "discord", "webhook_url"),
                               ("VALHEIM_LOG_USER", "source", "user"),
                               ("VALHEIM_LOG_PASSWORD", "source", "password"),
-                              ("NEXUS_TOKEN", "source", "token")):
+                              ("NEXUS_TOKEN", "source", "token"),
+                              ("STEAM_API_KEY", "source", "api_key")):
         if os.environ.get(env):
             cfg[section][key] = os.environ[env]
     return cfg
@@ -590,6 +635,7 @@ def main():
     ap.add_argument("--replay", metavar="FILE", help="Parse a local log file and print events (no Discord posts unless --post)")
     ap.add_argument("--post", action="store_true", help="With --replay, actually post to Discord")
     ap.add_argument("--test-webhook", action="store_true", help="Send a test message to the Discord webhook and exit")
+    ap.add_argument("--probe", action="store_true", help="Count mode: query the source once, print the result, and exit")
     ap.add_argument("--from-start", action="store_true", help="On first run, process the whole existing log instead of only new lines")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
@@ -633,12 +679,17 @@ def main():
 
     interval = float(cfg.get("poll_interval_seconds", 10))
 
+    if isinstance(source, A2SSource) and args.probe:
+        info = source._query()
+        print(f"{info['name']}  —  {info['players']}/{info['max_players']} players  (v{info.get('version','?')})")
+        return
+
     if isinstance(source, A2SSource):
         # Count-only mode: no log parsing, just diff the player count each poll.
         default_events = {"player_joined", "player_left", "server_online", "server_offline"}
         events = set(cfg.get("events") or default_events) & default_events or default_events
-        log.info("Monitoring %s:%d via Steam query for %s; posting %s every %.0fs",
-                 source.host, source.port, server_name, sorted(events), interval)
+        log.info("Monitoring %s:%d via %s for %s; posting %s every %.0fs", source.host, source.port,
+                 type(source).__name__, server_name, sorted(events), interval)
         while True:
             try:
                 for ev in source.poll():

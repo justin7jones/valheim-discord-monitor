@@ -5,7 +5,7 @@ on the game server, so Steam achievements keep working. Two modes:
 
 | Mode | Needs | Events |
 |---|---|---|
-| **Count mode** (`a2s`) | Only the server's IP — polls the Steam query port (game port + 1) | player joined / left (count only), server online / offline |
+| **Count mode** (`a2s` or `steamapi`) | Only the server's IP — polls the Steam query port (game port + 1), or Steam's master server via the Web API when that port is firewalled | player joined / left (count only), server online / offline |
 | **Log mode** (`ftp`, `sftp`, `file`, `http`, `nexus`) | Read access to `valheim_console.log` | named **login**, **logout**, **death**, respawn |
 
 Count mode works on any host, crossplay or not, and is the fallback when the
@@ -20,8 +20,9 @@ Python 3.9+, no third-party packages (SFTP is the one optional extra).
    ```bash
    python a2s_probe.py YOUR.SERVER.IP          # prints "name — 2/10 players (v0.220.5 …)"
    ```
-   Valheim's query port is the game port + 1 (2456 → 2457). If you get no
-   reply, the host may block UDP queries — ask them to open it.
+   Valheim's query port is the game port + 1 (2456 → 2457). **No reply?** The
+   host is firewalling UDP queries (LOW.MS does). Use the `steamapi` source
+   instead — see below.
 2. Create a Discord webhook (channel → Edit Channel → Integrations → Webhooks).
 3. `cp config.example.json config.json`, fill in `host` and `webhook_url`.
 4. `python valheim_discord_monitor.py --test-webhook`, then
@@ -32,6 +33,26 @@ count changes, and marks the server offline after `offline_after` consecutive
 failed queries (3 default) so a single dropped packet doesn't cause a false
 alarm. Nothing is posted on start-up. Messages use `{who}` ("A viking" / "2
 vikings"), `{count}`, `{max}` and `{server}` placeholders.
+
+### `steamapi` — when the query port is firewalled
+
+The game server sends its player count to Steam's master server itself
+(outbound heartbeats), so Steam can tell you the count even when nothing
+inbound reaches the server. Two requirements:
+
+1. The server is set **Public** in your host's panel (on LOW.MS: Manage →
+   General → Public Server). This only lists it in the community browser; the
+   password still applies.
+2. A free Steam Web API key from <https://steamcommunity.com/dev/apikey>
+   (any domain name will do).
+
+Config:
+```json
+"source": { "type": "steamapi", "host": "YOUR.SERVER.IP", "game_port": 2456, "api_key": "..." }
+```
+or leave `api_key` out and set the `STEAM_API_KEY` environment variable.
+Check it with `python valheim_discord_monitor.py --probe`. Steam refreshes
+its listing on the server's heartbeat, so counts can lag a minute or so.
 
 Limitations: A2S carries no names (Valheim returns an empty player list) and no
 death information. Two players swapping within one poll interval shows as no
@@ -145,6 +166,7 @@ or run it in a terminal.
 | `events` | mode default | Log mode: `login`, `logout`, `death`, `respawn`, `server_up`. Count mode: `player_joined`, `player_left`, `server_online`, `server_offline`. |
 | `poll_interval_seconds` | 15 | How often to poll. |
 | `source.offline_after` | 3 | Count mode: failed queries in a row before "offline". |
+| `source.api_key` | — | `steamapi` only; or `STEAM_API_KEY` env var. |
 | `discord.embeds` | true | Coloured embed vs plain text. |
 | `discord.show_player_count` | true | Footer with the current online count. |
 | `discord.messages` | see example | Per-event templates; `{player}`, `{server}`, `{who}`, `{count}`, `{max}` placeholders. |

@@ -33,6 +33,13 @@
     "offline_after": 3
   },
   "_alternative_sources": {
+    "steamapi": {
+      "type": "steamapi",
+      "host": "YOUR.SERVER.IP",
+      "game_port": 2456,
+      "api_key": "YOUR-STEAM-WEB-API-KEY-OR-USE-STEAM_API_KEY-ENV",
+      "offline_after": 3
+    },
     "ftp": {
       "type": "ftp",
       "host": "YOUR.SERVER.IP",
