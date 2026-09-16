@@ -150,6 +150,18 @@ class Store:
         self._touch(ts)
         self.conn.commit()
 
+    def logout_stale(self, player: str, ts: int) -> None:
+        """Close an open session left behind by a server shutdown/restart. Ends it at the
+        last activity we saw (last_seen_at), so the downtime isn't counted as play time."""
+        row = self._open_session(player)
+        if row is None:
+            self._touch(ts)
+            self.conn.commit()
+            return
+        self.conn.execute("UPDATE play_sessions SET logout_at = last_seen_at WHERE id=?", (row["id"],))
+        self._touch(ts)
+        self.conn.commit()
+
     def death(self, player: str, ts: int) -> None:
         row = self._open_session(player)
         sid = row["id"] if row else None

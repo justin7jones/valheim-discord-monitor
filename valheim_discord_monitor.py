@@ -82,6 +82,10 @@ RE_CONNECTIONS = re.compile(_TS + r"Connections (?P<count>\d+) ZDOS")
 RE_SERVERNAME = re.compile(r"server \"(?P<server>[^\"]*)\"")
 RE_READY = re.compile(_TS + r"Game server connected")
 RE_TIMEOUT = re.compile(_TS + r"ZRpc timeout detected")
+# Server shutting down (scheduled restart, backup, update, crash). A graceful stop
+# prints these but NOT per-player "Destroying" lines or "now 0 player(s)", so anyone
+# online would otherwise stay stuck as online — we flush them on any of these.
+RE_SHUTDOWN = re.compile(_TS + r"(?:Game - )?OnApplicationQuit|ZNet Shutdown|ZNet OnDestroy")
 
 
 @dataclass
@@ -138,9 +142,27 @@ class ValheimLogParser:
             self.s.server_count = max(0, self.s.server_count - 1)
         return Event("logout", name, self._count())
 
+    def _flush(self) -> Iterator["Event"]:
+        """Log everyone out — used when the server shuts down or a new session starts,
+        where the game never prints per-player disconnects. Sessions are closed at their
+        last seen activity (stale=True), so downtime isn't counted as play time."""
+        for name in list(self.s.online):
+            owner = self.s.online.pop(name, None)
+            self.s.owner_to_name.pop(owner, None)
+            self.s.dead.discard(name)
+            yield Event("logout", name, {"count": len(self.s.online), "stale": True})
+        self.s.server_count = 0
+
     def _feed(self, line: str) -> Iterator[Event]:
         line = line.rstrip("\r\n")
         if not line:
+            return
+
+        # Server shutting down: the game prints no per-player disconnects here, so
+        # log everyone out now (scheduled restart / backup / update / crash).
+        if RE_SHUTDOWN.search(line):
+            yield from self._flush()
+            self.s.server_count = 0
             return
 
         # Keep the authoritative count up to date from any line that carries it.
@@ -148,12 +170,10 @@ class ValheimLogParser:
         if m:
             self.s.server_count = int(m.group("count"))
             yield Event("count", None, {"count": self.s.server_count})
-            # Steady-state truth: if the server says nobody is on, clear our roster.
+            # Steady-state truth: if the server says nobody is on, log out anyone we
+            # still think is online (a stuck player whose disconnect we never saw).
             if self.s.server_count == 0 and self.s.online:
-                for name in list(self.s.online):
-                    self.s.online.pop(name, None)
-                self.s.owner_to_name.clear()
-                self.s.dead.clear()
+                yield from self._flush()
             return
 
         m = RE_ZDOID.search(line)
@@ -213,6 +233,9 @@ class ValheimLogParser:
             return
 
         if RE_READY.search(line):
+            # A new server session is starting. Flush anyone still tracked (in case we
+            # never saw the shutdown that ended the previous session), then reset.
+            yield from self._flush()
             self.s = ParserState()
             yield Event("server_up")
             return
@@ -709,7 +732,7 @@ def record_event(store, ev: "Event") -> None:
     if ev.kind == "login":
         store.login(ev.player, ts)
     elif ev.kind == "logout":
-        store.logout(ev.player, ts)
+        (store.logout_stale if ev.extra.get("stale") else store.logout)(ev.player, ts)
     elif ev.kind == "death":
         store.death(ev.player, ts)
     elif ev.kind == "count" and ev.extra.get("count") is not None:
