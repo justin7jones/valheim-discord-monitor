@@ -103,6 +103,7 @@ class ParserState:
     pending_ids: list = field(default_factory=list)  # Steam connection ids not yet paired with a name
     id_to_name: dict = field(default_factory=dict)   # Steam connection id -> name
     server_count: Optional[int] = None               # authoritative count from the server's own log lines
+    down: bool = False                               # True after a shutdown, until the next boot
 
 
 class ValheimLogParser:
@@ -159,9 +160,13 @@ class ValheimLogParser:
             return
 
         # Server shutting down: the game prints no per-player disconnects here, so
-        # log everyone out now (scheduled restart / backup / update / crash).
+        # log everyone out now (scheduled restart / backup / update / crash) and post
+        # one "restarting" line instead of a logout per player.
         if RE_SHUTDOWN.search(line):
             yield from self._flush()
+            if not self.s.down:
+                self.s.down = True
+                yield Event("server_restart", None, {})
             self.s.server_count = 0
             return
 
@@ -233,33 +238,48 @@ class ValheimLogParser:
             return
 
         if RE_READY.search(line):
-            # A new server session is starting. Flush anyone still tracked (in case we
-            # never saw the shutdown that ended the previous session), then reset.
-            yield from self._flush()
+            # A new server session is starting.
+            had_players = bool(self.s.online)
+            was_down = self.s.down
+            yield from self._flush()          # close anyone still tracked (stale, not posted)
             self.s = ParserState()
-            yield Event("server_up")
+            # If players were still online and we never saw the shutdown, note the restart
+            # now; then always announce the server is back up.
+            if had_players and not was_down:
+                yield Event("server_restart", None, {})
+            yield Event("server_online", None, {})
             return
 
 
 # ---------------------------------------------------------------------------
 # Discord webhook
 # ---------------------------------------------------------------------------
+class _SafeDict(dict):
+    """format_map helper: a missing {placeholder} renders empty instead of raising,
+    so a message template can reference {count} etc. even for events that lack it."""
+    def __missing__(self, key):
+        return ""
+
+
 class Discord:
     COLORS = {"login": 0x57F287, "logout": 0x95A5A6, "death": 0xED4245, "respawn": 0xFEE75C, "server_up": 0x5865F2,
-              "player_joined": 0x57F287, "player_left": 0x95A5A6, "server_online": 0x5865F2, "server_offline": 0xED4245}
+              "player_joined": 0x57F287, "player_left": 0x95A5A6, "server_online": 0x57F287, "server_offline": 0xED4245,
+              "server_restart": 0xE0A13C}
     EMOJI = {"login": "🟢", "logout": "🔴", "death": "💀", "respawn": "🔥", "server_up": "🛡️",
-             "player_joined": "🟢", "player_left": "🔴", "server_online": "🛡️", "server_offline": "🔴"}
+             "player_joined": "🟢", "player_left": "🔴", "server_online": "🟢", "server_offline": "🔴",
+             "server_restart": "🔻"}
     DEFAULT_MESSAGES = {
         "login": "**{player}** has arrived in {server}.",
         "logout": "**{player}** has left {server}.",
         "death": "**{player}** has died. Odin is watching.",
         "respawn": "**{player}** has respawned.",
         "server_up": "{server} is online.",
+        "server_restart": "**{server}** is restarting — all players have been disconnected.",
+        "server_online": "**{server}** is back online!",
+        "server_offline": "**{server}** is offline — it went down and hasn't come back.",
         # Count-only events (a2s source): no names available.
         "player_joined": "{who} arrived in {server}. **{count}/{max}** online.",
         "player_left": "{who} left {server}. **{count}/{max}** online.",
-        "server_online": "{server} is back online. **{count}/{max}** online.",
-        "server_offline": "{server} is not responding — it may be down or restarting.",
     }
 
     def __init__(self, webhook_url: str, username: str = "Valheim", show_count: bool = True,
@@ -273,8 +293,13 @@ class Discord:
     def post(self, ev: Event, server_name: str, event_filter: set) -> None:
         if ev.kind not in event_filter or ev.kind not in self.messages:
             return
-        fields = {**ev.extra, "player": ev.player, "server": server_name or ev.extra.get("server", "the server")}
-        text = self.messages[ev.kind].format(**fields)
+        # Per-player logouts from a shutdown flush are summarised by one server_restart
+        # line, so don't post them individually.
+        if ev.kind == "logout" and ev.extra.get("stale"):
+            return
+        fields = _SafeDict({**ev.extra, "player": ev.player,
+                            "server": server_name or ev.extra.get("server", "the server")})
+        text = self.messages[ev.kind].format_map(fields)
         emoji = self.EMOJI.get(ev.kind, "")
         footer = f"{ev.extra['count']} player(s) online" if self.show_count and "count" in ev.extra else None
         if self.use_embeds:
@@ -878,12 +903,19 @@ def main():
     else:
         tailer = OffsetTailer(source, cfg.get("state_file", "monitor_state.json"), start_at_end=not args.from_start)
     parser = ValheimLogParser()
-    log_events = {"login", "logout", "death", "respawn", "server_up"}
-    events = set(cfg.get("events") or ()) & log_events or {"login", "logout", "death"}
+    log_events = {"login", "logout", "death", "respawn", "server_up",
+                  "server_restart", "server_online", "server_offline"}
+    default_log_events = {"login", "logout", "death", "server_restart", "server_online", "server_offline"}
+    events = set(cfg.get("events") or ()) & log_events or default_log_events
 
     store = open_store() if db_enabled else None
     render_interval = float(site_cfg.get("render_interval_seconds", 60))
     last_render = 0.0
+    # If a shutdown isn't followed by a boot within this window, treat it as offline
+    # (vs a quick restart that comes back) and post the offline message once.
+    offline_grace = float(cfg.get("offline_grace_seconds", 300))
+    down_since = None
+    offline_posted = False
     log.info("Monitoring %s source for %s; posting %s every %.0fs%s", cfg["source"]["type"], server_name,
              sorted(events), interval, "; recording stats" if store else "")
     render_site("(startup)")
@@ -904,8 +936,17 @@ def main():
                         except Exception as e:
                             log.warning("DB write failed for %s: %s", ev.kind, e)
                     discord.post(ev, server_name, events)
+                    # Track down/up so we can tell a lingering outage from a quick restart.
+                    if ev.kind == "server_restart":
+                        down_since, offline_posted = time.time(), False
+                    elif ev.kind in ("server_online", "login"):
+                        down_since = None
             backoff = interval
             now = time.time()
+            if down_since and not offline_posted and now - down_since > offline_grace:
+                discord.post(Event("server_offline", None, {}), server_name, events)
+                offline_posted = True
+                down_since = None
             if changed and store and site_cfg.get("output") and now - last_render >= render_interval:
                 render_site()
                 last_render = now

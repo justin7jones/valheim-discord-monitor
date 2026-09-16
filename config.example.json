@@ -2,6 +2,7 @@
   "server_name": "My Valheim Server",
   "poll_interval_seconds": 15,
   "state_file": "monitor_state.json",
+  "offline_grace_seconds": 300,
   "events": [
     "player_joined",
     "player_left",
@@ -29,11 +30,12 @@
       "logout": "**{player}** has left {server}.",
       "death": "**{player}** has died. Odin is watching.",
       "respawn": "**{player}** has respawned.",
-      "server_up": "{server} is online.",
+      "server_restart": "**{server}** is restarting — all players have been disconnected.",
+      "server_online": "**{server}** is back online!",
+      "server_offline": "**{server}** is offline — it went down and hasn't come back.",
       "player_joined": "{who} arrived in {server}. **{count}/{max}** online.",
       "player_left": "{who} left {server}. **{count}/{max}** online.",
-      "server_online": "{server} is back online. **{count}/{max}** online.",
-      "server_offline": "{server} is not responding — it may be down or restarting."
+      "server_up": "{server} is online."
     }
   },
   "source": {
