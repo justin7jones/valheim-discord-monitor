@@ -55,6 +55,12 @@ def fmt_date(epoch: Optional[int]) -> str:
     return time.strftime("%b %-d, %Y", time.gmtime(epoch))
 
 
+def fmt_date_short(epoch: Optional[int]) -> str:
+    if not epoch:
+        return "\u2014"
+    return time.strftime("%b %-d", time.gmtime(epoch))
+
+
 def fmt_datetime(epoch: Optional[int]) -> str:
     if not epoch:
         return "—"
@@ -154,7 +160,7 @@ def render_html(db_path: str, cfg: dict) -> str:
                 f'<span class="bar-val">{esc(fmt_duration(r["total_seconds"]))}</span></div>')
 
     play_board = leaderboard(
-        "Most Time in Midgard", "Total hours across all sessions", lb,
+        "Most Time in the Tenth Realm", "Total hours across all sessions", lb,
         [("Viking", lambda r: f'<span class="name">{esc(r["player"])}</span>', "name-col"),
          ("Playtime", play_bar, "num bar-col"),
          ("Sessions", lambda r: esc(r["sessions"]), "num hide-sm")],
@@ -176,7 +182,7 @@ def render_html(db_path: str, cfg: dict) -> str:
         "Longest Single Session", "One unbroken stretch online", longest,
         [("Viking", lambda r: f'<span class="name">{esc(r["player"])}</span>', "name-col"),
          ("Length", lambda r: esc(fmt_duration(r["duration_seconds"])), "num"),
-         ("When", lambda r: esc(fmt_date(r["login_at"])), "num hide-sm")],
+         ("When", lambda r: esc(fmt_date_short(r["login_at"])), "num hide-sm")],
         "No sessions recorded yet.")
 
     # --- server stat tiles ---
@@ -200,7 +206,7 @@ def render_html(db_path: str, cfg: dict) -> str:
             f'<span class="since">since {esc(fmt_datetime(o["login_at"]))}</span></li>'
             for o in online)
         online_html = (f'<div class="online-head"><span class="pip"></span>'
-                       f'<strong>{len(online)}</strong> in Midgard now</div>'
+                       f'<strong>{len(online)}</strong> in the Tenth Realm now</div>'
                        f'<ul class="online-list">{online_items}</ul>')
     else:
         online_html = ('<div class="online-head offline"><span class="pip"></span>'
@@ -333,7 +339,7 @@ TEMPLATE = """<!doctype html>
   .board-head p {{ margin:1px 0 0; color:var(--muted); font-size:.84rem; }}
   .table-wrap {{ overflow-x:auto; }}
   table {{ width:100%; border-collapse:collapse; font-size:.97rem; }}
-  th, td {{ padding:10px 20px; text-align:left; }}
+  th, td {{ padding:10px 14px; text-align:left; }}
   thead th {{ text-transform:uppercase; letter-spacing:.1em; font-size:.74rem; color:var(--faint);
     border-bottom:1px solid var(--edge); }}
   tbody tr {{ border-bottom:1px solid rgba(51,64,60,.5); }}
