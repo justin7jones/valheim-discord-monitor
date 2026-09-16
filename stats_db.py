@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+SQLite store for Valheim play sessions, deaths and server concurrency.
+
+Free, open-source, lightweight — a single .db file via Python's built-in sqlite3,
+no server process. The monitor records events here; stats_site.py renders the
+public page from it.
+
+Schema
+------
+play_sessions   one row per continuous play session (login -> logout)
+    id, player, login_at, logout_at (NULL = still open), last_seen_at,
+    deaths (count during the session), source,
+    duration_seconds  -- GENERATED: seconds online, capped at last_seen_at while open
+deaths          one row per death
+    id, player, died_at, session_id
+concurrency     one row per change in the online count (for "most online at once")
+    id, at, count
+meta            key/value (last_event_at, schema_version, …)
+
+All timestamps are unix epoch seconds. Log timestamps are parsed as the server's
+wall clock; durations are differences so the timezone cancels out.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import time
+from typing import Optional
+
+SCHEMA_VERSION = 1
+
+
+def connect(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")       # concurrent reader (the site generator) is fine
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    init_schema(conn)
+    return conn
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS play_sessions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            player       TEXT    NOT NULL,
+            login_at     INTEGER NOT NULL,
+            logout_at    INTEGER,
+            last_seen_at INTEGER NOT NULL,
+            deaths       INTEGER NOT NULL DEFAULT 0,
+            source       TEXT,
+            duration_seconds INTEGER
+                GENERATED ALWAYS AS (COALESCE(logout_at, last_seen_at) - login_at) VIRTUAL
+        );
+        CREATE INDEX IF NOT EXISTS ix_sessions_player ON play_sessions(player);
+        CREATE INDEX IF NOT EXISTS ix_sessions_open   ON play_sessions(player, logout_at);
+
+        CREATE TABLE IF NOT EXISTS deaths (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            player     TEXT    NOT NULL,
+            died_at    INTEGER NOT NULL,
+            session_id INTEGER REFERENCES play_sessions(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_deaths_player ON deaths(player);
+
+        CREATE TABLE IF NOT EXISTS concurrency (
+            id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            at    INTEGER NOT NULL,
+            count INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_concurrency_at ON concurrency(at);
+
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """
+    )
+    conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+    conn.commit()
+
+
+class Store:
+    """Event sink: turns login/logout/death/count events into rows."""
+
+    def __init__(self, path: str, source: str = "nexus"):
+        self.conn = connect(path)
+        self.source = source
+        self.reconcile_open_sessions()
+
+    # -- meta --------------------------------------------------------------
+    def _set_meta(self, key: str, value) -> None:
+        self.conn.execute("INSERT INTO meta(key, value) VALUES (?, ?) "
+                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+    def get_meta(self, key: str, default=None):
+        row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def _touch(self, ts: int) -> None:
+        prev = self.get_meta("last_event_at")
+        if prev is None or ts > int(prev):
+            self._set_meta("last_event_at", ts)
+
+    def reconcile_open_sessions(self) -> None:
+        """On startup, close any sessions left open by a previous run so they don't
+        grow forever. They are closed at their last_seen_at (the newest log line we
+        had recorded for them), which bounds the play time to reality."""
+        n = self.conn.execute(
+            "UPDATE play_sessions SET logout_at = last_seen_at "
+            "WHERE logout_at IS NULL AND last_seen_at > login_at"
+        ).rowcount
+        # Zero-length leftovers (login with no activity) — just close them too.
+        self.conn.execute("UPDATE play_sessions SET logout_at = login_at WHERE logout_at IS NULL")
+        self.conn.commit()
+        return n
+
+    # -- open-session lookup ----------------------------------------------
+    def _open_session(self, player: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM play_sessions WHERE player=? AND logout_at IS NULL "
+            "ORDER BY login_at DESC LIMIT 1", (player,)
+        ).fetchone()
+
+    # -- event handlers ----------------------------------------------------
+    def login(self, player: str, ts: int) -> None:
+        # Close any dangling open session for this player first (crash/rejoin safety).
+        self.conn.execute(
+            "UPDATE play_sessions SET logout_at = last_seen_at "
+            "WHERE player=? AND logout_at IS NULL", (player,))
+        self.conn.execute(
+            "INSERT INTO play_sessions(player, login_at, last_seen_at, source) VALUES (?,?,?,?)",
+            (player, ts, ts, self.source))
+        self._touch(ts)
+        self.conn.commit()
+
+    def logout(self, player: str, ts: int) -> None:
+        row = self._open_session(player)
+        if row is None:
+            # Player was online before the monitor started; no login recorded — skip.
+            self._touch(ts)
+            self.conn.commit()
+            return
+        self.conn.execute(
+            "UPDATE play_sessions SET logout_at=?, last_seen_at=MAX(last_seen_at, ?) WHERE id=?",
+            (ts, ts, row["id"]))
+        self._touch(ts)
+        self.conn.commit()
+
+    def death(self, player: str, ts: int) -> None:
+        row = self._open_session(player)
+        sid = row["id"] if row else None
+        self.conn.execute("INSERT INTO deaths(player, died_at, session_id) VALUES (?,?,?)", (player, ts, sid))
+        if sid is not None:
+            self.conn.execute("UPDATE play_sessions SET deaths = deaths + 1, last_seen_at=MAX(last_seen_at, ?) "
+                             "WHERE id=?", (ts, sid))
+        self._touch(ts)
+        self.conn.commit()
+
+    def heartbeat(self, ts: int) -> None:
+        """Advance last_seen_at on every open session so an open session's duration
+        tracks the live log even between the player's own events."""
+        self.conn.execute("UPDATE play_sessions SET last_seen_at=? WHERE logout_at IS NULL AND last_seen_at < ?",
+                          (ts, ts))
+        self._touch(ts)
+        self.conn.commit()
+
+    def concurrency(self, count: int, ts: int) -> None:
+        last = self.conn.execute("SELECT count FROM concurrency ORDER BY at DESC, id DESC LIMIT 1").fetchone()
+        if last is None or last["count"] != count:
+            self.conn.execute("INSERT INTO concurrency(at, count) VALUES (?,?)", (ts, count))
+        self.heartbeat(ts)
+
+    def close(self) -> None:
+        self.conn.commit()
+        self.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Read-side: everything the stats page needs, as plain dicts.
+# ---------------------------------------------------------------------------
+def _rows(conn, sql, params=()):
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def _one(conn, sql, params=()):
+    r = conn.execute(sql, params).fetchone()
+    return dict(r) if r else {}
+
+
+def player_leaderboard(conn, limit: int = 10):
+    return _rows(conn, """
+        SELECT s.player,
+               SUM(s.duration_seconds)                     AS total_seconds,
+               COUNT(*)                                     AS sessions,
+               MAX(s.duration_seconds)                      AS longest_seconds,
+               MIN(s.login_at)                              AS first_seen,
+               MAX(COALESCE(s.logout_at, s.last_seen_at))   AS last_seen,
+               COALESCE(d.deaths, 0)                        AS deaths
+        FROM play_sessions s
+        LEFT JOIN (SELECT player, COUNT(*) AS deaths FROM deaths GROUP BY player) d
+               ON d.player = s.player
+        GROUP BY s.player
+        ORDER BY total_seconds DESC
+        LIMIT ?""", (limit,))
+
+
+def top_deaths(conn, limit: int = 10):
+    return _rows(conn, """
+        SELECT player, COUNT(*) AS deaths
+        FROM deaths GROUP BY player ORDER BY deaths DESC LIMIT ?""", (limit,))
+
+
+def top_sessions(conn, limit: int = 10):
+    return _rows(conn, """
+        SELECT player, COUNT(*) AS sessions
+        FROM play_sessions GROUP BY player ORDER BY sessions DESC LIMIT ?""", (limit,))
+
+
+def longest_single_sessions(conn, limit: int = 10):
+    return _rows(conn, """
+        SELECT player, duration_seconds, login_at
+        FROM play_sessions WHERE duration_seconds IS NOT NULL
+        ORDER BY duration_seconds DESC LIMIT ?""", (limit,))
+
+
+def server_stats(conn):
+    s = _one(conn, """
+        SELECT COUNT(*)                          AS total_sessions,
+               COUNT(DISTINCT player)            AS unique_players,
+               COALESCE(SUM(duration_seconds),0) AS total_seconds,
+               MIN(login_at)                     AS first_login
+        FROM play_sessions""")
+    s["total_deaths"] = _one(conn, "SELECT COUNT(*) AS c FROM deaths").get("c", 0)
+    peak = _one(conn, "SELECT MAX(count) AS peak FROM concurrency")
+    s["peak_online"] = peak.get("peak") or 0
+    peak_at = _one(conn, "SELECT at FROM concurrency WHERE count=? ORDER BY at ASC LIMIT 1",
+                   (s["peak_online"],))
+    s["peak_online_at"] = peak_at.get("at")
+    now_row = _one(conn, "SELECT count FROM concurrency ORDER BY at DESC, id DESC LIMIT 1")
+    s["currently_online"] = now_row.get("count", 0)
+    return s
+
+
+def currently_online(conn):
+    return _rows(conn, """
+        SELECT player, login_at, last_seen_at
+        FROM play_sessions WHERE logout_at IS NULL ORDER BY login_at ASC""")
+
+
+def recent_activity(conn, limit: int = 15):
+    return _rows(conn, """
+        SELECT player, login_at AS at, 'login' AS kind FROM play_sessions
+        UNION ALL SELECT player, logout_at AS at, 'logout' FROM play_sessions WHERE logout_at IS NOT NULL
+        UNION ALL SELECT player, died_at AS at, 'death' FROM deaths
+        ORDER BY at DESC LIMIT ?""", (limit,))

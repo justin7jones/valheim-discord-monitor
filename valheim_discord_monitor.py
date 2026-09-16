@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import calendar
 import fnmatch
 import io
 import json
@@ -50,6 +51,21 @@ log = logging.getLogger("valheim-monitor")
 # ---------------------------------------------------------------------------
 # Optional "MM/DD/YYYY HH:MM:SS: " prefix that the server prints on most lines.
 _TS = r"^\s*(?:\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}:\s*)?"
+RE_TS = re.compile(r"^\s*(\d{2})/(\d{2})/(\d{4}) (\d{2}):(\d{2}):(\d{2}):")
+
+
+def parse_log_ts(line: str) -> Optional[int]:
+    """Unix epoch (UTC-normalised) from a 'MM/DD/YYYY HH:MM:SS:' log prefix, else None.
+    Times are parsed consistently, so session durations are correct regardless of the
+    server's actual timezone."""
+    m = RE_TS.match(line)
+    if not m:
+        return None
+    mo, d, y, hh, mm, ss = (int(x) for x in m.groups())
+    try:
+        return int(calendar.timegm((y, mo, d, hh, mm, ss, 0, 0, 0)))
+    except (ValueError, OverflowError):
+        return None
 
 # Character spawn / despawn. `owner` is the peer's ZDO owner id for this session.
 RE_ZDOID = re.compile(_TS + r"Got character ZDOID from (?P<name>.+?) : (?P<owner>-?\d+):(?P<n>\d+)\s*$")
@@ -97,9 +113,19 @@ class ValheimLogParser:
 
     def __init__(self):
         self.s = ParserState()
+        self.last_ts: Optional[int] = None      # epoch of the most recent timestamped log line
 
     def _count(self) -> dict:
         return {"count": self.s.server_count} if self.s.server_count is not None else {}
+
+    def feed(self, line: str) -> Iterator["Event"]:
+        """Parse one line, stamping each emitted event with the log timestamp (epoch)."""
+        ts = parse_log_ts(line)
+        if ts is not None:
+            self.last_ts = ts
+        for ev in self._feed(line):
+            ev.extra.setdefault("ts", self.last_ts if self.last_ts is not None else int(time.time()))
+            yield ev
 
     def _logout(self, name: str) -> Event:
         owner = self.s.online.pop(name, None)
@@ -112,7 +138,7 @@ class ValheimLogParser:
             self.s.server_count = max(0, self.s.server_count - 1)
         return Event("logout", name, self._count())
 
-    def feed(self, line: str) -> Iterator[Event]:
+    def _feed(self, line: str) -> Iterator[Event]:
         line = line.rstrip("\r\n")
         if not line:
             return
@@ -121,6 +147,7 @@ class ValheimLogParser:
         m = RE_COUNT.search(line) or RE_CONNECTIONS.search(line)
         if m:
             self.s.server_count = int(m.group("count"))
+            yield Event("count", None, {"count": self.s.server_count})
             # Steady-state truth: if the server says nobody is on, clear our roster.
             if self.s.server_count == 0 and self.s.online:
                 for name in list(self.s.online):
@@ -674,6 +701,21 @@ def build_source(cfg: dict):
     sys.exit(f"Unknown source type: {t}")
 
 
+def record_event(store, ev: "Event") -> None:
+    """Write one parsed event into the stats database."""
+    ts = ev.extra.get("ts")
+    if ts is None:
+        return
+    if ev.kind == "login":
+        store.login(ev.player, ts)
+    elif ev.kind == "logout":
+        store.logout(ev.player, ts)
+    elif ev.kind == "death":
+        store.death(ev.player, ts)
+    elif ev.kind == "count" and ev.extra.get("count") is not None:
+        store.concurrency(int(ev.extra["count"]), ts)
+
+
 def load_config(path: str) -> dict:
     with open(path) as f:
         cfg = json.load(f)
@@ -700,6 +742,8 @@ def main():
     ap.add_argument("--test-webhook", action="store_true", help="Send a test message to the Discord webhook and exit")
     ap.add_argument("--probe", action="store_true", help="Count mode: query the source once, print the result, and exit")
     ap.add_argument("--from-start", action="store_true", help="On first run, process the whole existing log instead of only new lines")
+    ap.add_argument("--backfill", metavar="FILE", help="Load a whole log file into the stats database (no Discord posts), then exit")
+    ap.add_argument("--render-site", action="store_true", help="Render the stats web page from the database once and exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -712,6 +756,47 @@ def main():
     discord = Discord(d.get("webhook_url", ""), d.get("username", "Valheim"),
                       show_count=d.get("show_player_count", True), use_embeds=d.get("embeds", True),
                       messages=d.get("messages"))
+
+    db_cfg = cfg.get("database") or {}
+    db_enabled = bool(db_cfg.get("path")) and db_cfg.get("enabled", True)
+    site_cfg = cfg.get("stats_site") or {}
+
+    def open_store():
+        from stats_db import Store
+        return Store(db_cfg["path"], source=cfg.get("source", {}).get("type", "log"))
+
+    def render_site(reason=""):
+        out = site_cfg.get("output")
+        if not (db_enabled and out):
+            return
+        try:
+            import stats_site
+            stats_site.render(db_cfg["path"], out, cfg)
+            log.info("Rendered stats page -> %s %s", out, reason)
+        except Exception as e:
+            log.warning("Stats page render failed: %s", e)
+
+    if args.render_site:
+        if not (db_enabled and site_cfg.get("output")):
+            sys.exit("Configure database.path and stats_site.output first")
+        render_site("(--render-site)")
+        return
+
+    if args.backfill:
+        if not db_enabled:
+            sys.exit("Configure a database.path to backfill into")
+        store = open_store()
+        parser = ValheimLogParser()
+        n = 0
+        with open(args.backfill, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                for ev in parser.feed(line):
+                    record_event(store, ev)
+                    n += 1
+        store.close()
+        log.info("Backfilled %d events from %s", n, args.backfill)
+        render_site("(after backfill)")
+        return
 
     if args.replay:
         parser = ValheimLogParser()
@@ -772,19 +857,39 @@ def main():
     parser = ValheimLogParser()
     log_events = {"login", "logout", "death", "respawn", "server_up"}
     events = set(cfg.get("events") or ()) & log_events or {"login", "logout", "death"}
-    log.info("Monitoring %s source for %s; posting %s every %.0fs", cfg["source"]["type"], server_name, sorted(events), interval)
+
+    store = open_store() if db_enabled else None
+    render_interval = float(site_cfg.get("render_interval_seconds", 60))
+    last_render = 0.0
+    log.info("Monitoring %s source for %s; posting %s every %.0fs%s", cfg["source"]["type"], server_name,
+             sorted(events), interval, "; recording stats" if store else "")
+    render_site("(startup)")
 
     backoff = interval
     while True:
         try:
+            changed = False
             for line in tailer.poll():
                 log.debug("LOG: %s", line)
                 for ev in parser.feed(line):
-                    log.info("EVENT %-8s %s %s", ev.kind, ev.player or "", ev.extra)
+                    if ev.kind != "count":
+                        log.info("EVENT %-8s %s %s", ev.kind, ev.player or "", ev.extra)
+                    if store:
+                        try:
+                            record_event(store, ev)
+                            changed = True
+                        except Exception as e:
+                            log.warning("DB write failed for %s: %s", ev.kind, e)
                     discord.post(ev, server_name, events)
             backoff = interval
+            now = time.time()
+            if changed and store and site_cfg.get("output") and now - last_render >= render_interval:
+                render_site()
+                last_render = now
         except KeyboardInterrupt:
             log.info("Stopping")
+            if store:
+                store.close()
             return
         except Exception as e:
             log.warning("Poll failed: %s (retrying in %.0fs)", e, backoff)

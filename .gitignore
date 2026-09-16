@@ -13,3 +13,10 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Stats database and generated site
+*.db
+*.db-wal
+*.db-shm
+valheim_stats.db*
+/site/

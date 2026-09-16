@@ -160,6 +160,37 @@ file you sync locally.
 SFTP needs `pip install paramiko`. `http` polls any URL that returns the raw
 log text (supports `Range` requests if the server does).
 
+## Player stats & public web page
+
+The monitor can record every login, logout and death into a small **SQLite**
+database (`sqlite3`, built into Python — no server, one file) and regenerate a
+self-contained public web page of leaderboards from it: most play time, most
+deaths, longest session, most visits, plus server totals (total hours, unique
+players, peak players online at once). Enable it with `database` and
+`stats_site` blocks in `config.json`:
+
+```json
+"database": { "path": "valheim_stats.db", "enabled": true },
+"stats_site": { "output": "/var/www/valheimstats/index.html", "render_interval_seconds": 60 }
+```
+
+- `play_sessions` — one row per session: `player`, `login_at`, `logout_at`,
+  `deaths`, and a generated `duration_seconds` column (time in game, capped at the
+  last log line seen while a session is still open).
+- `deaths` — one row per death. `concurrency` — the online count over time, for
+  "most online at once".
+
+Useful commands:
+```bash
+python3 valheim_discord_monitor.py --config config.json --backfill server.log   # seed history from a log file
+python3 valheim_discord_monitor.py --config config.json --render-site           # write the page once
+python3 stats_site.py --db valheim_stats.db --out /var/www/valheimstats/index.html --config config.json
+```
+
+The page is static HTML — no scripts, no inputs, no auth needed — so it is safe to
+host publicly. **Full deployment (DNS, nginx/Caddy, backfill): see
+[DEPLOY_STATS.md](DEPLOY_STATS.md).**
+
 ## Running it permanently
 
 **Docker**

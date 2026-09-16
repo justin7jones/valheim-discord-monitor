@@ -8,6 +8,17 @@
     "server_online",
     "server_offline"
   ],
+  "database": {
+    "path": "valheim_stats.db",
+    "enabled": true
+  },
+  "stats_site": {
+    "output": "/var/www/valheimstats/index.html",
+    "render_interval_seconds": 60,
+    "refresh_seconds": 120,
+    "top_n": 10,
+    "timezone_label": "server time"
+  },
   "discord": {
     "webhook_url": "https://discord.com/api/webhooks/XXXX/YYYY",
     "username": "Valheim",
