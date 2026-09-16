@@ -14,6 +14,7 @@ is HTML-escaped.
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import json
 import os
@@ -21,6 +22,9 @@ import time
 from typing import Optional
 
 import stats_db
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_BANNER = os.path.join(HERE, "assets", "banner.webp")
 
 
 # ---------------------------------------------------------------------------
@@ -78,14 +82,14 @@ def esc(v) -> str:
 # ---------------------------------------------------------------------------
 # HTML building blocks
 # ---------------------------------------------------------------------------
-VALKNUT = (
-    '<svg class="valknut" viewBox="0 0 100 92" aria-hidden="true">'
-    '<g fill="none" stroke="currentColor" stroke-width="4" stroke-linejoin="round">'
-    '<path d="M50 6 L15 66 L85 66 Z"/>'
-    '<path d="M32 18 L-3 78 L67 78 Z" transform="translate(21 -6)"/>'
-    '<path d="M50 20 L26 62 L74 62 Z"/>'
-    '</g></svg>'
-)
+def banner_data_uri(cfg: dict) -> Optional[str]:
+    path = (cfg.get("stats_site") or {}).get("banner", DEFAULT_BANNER)
+    if not path or not os.path.exists(path):
+        return None
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    mime = {"webp": "image/webp", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(ext, "image/png")
+    with open(path, "rb") as f:
+        return f"data:{mime};base64," + base64.b64encode(f.read()).decode("ascii")
 
 
 def rank_rows(rows, cols, empty="No sagas recorded yet."):
@@ -216,10 +220,16 @@ def render_html(db_path: str, cfg: dict) -> str:
     refresh = int((cfg.get("stats_site") or {}).get("refresh_seconds", 120))
     updated = fmt_datetime(now)
 
+    banner = banner_data_uri(cfg)
+    if banner:
+        masthead = (f'<div class="masthead"><img src="{banner}" alt="{esc(server_name)}"></div>')
+    else:
+        masthead = f'<div class="masthead nomast"><h1 class="mast-title">{esc(server_name)}</h1></div>'
+
     return TEMPLATE.format(
         title=esc(f"{server_name} — Stats"),
         server_name=esc(server_name),
-        valknut=VALKNUT,
+        masthead=masthead,
         online_html=online_html,
         tiles=tiles_html,
         play_board=play_board,
@@ -244,121 +254,122 @@ TEMPLATE = """<!doctype html>
 <title>{title}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Spectral:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IM+Fell+English+SC&family=Alegreya+Sans:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
 <style>
   :root {{
-    --ground:#12161a; --ground2:#0d1013;
-    --stone:#1b2127; --stone2:#222a31; --edge:#333e49; --edge2:#3f4c58;
-    --bone:#e8e3d6; --muted:#9aa6b0; --faint:#6d7982;
-    --ember:#e0a13c; --ember-dim:#a9761f; --moss:#87bd6d; --blood:#cf5b52; --rune:#79a6cf;
-    --shadow:0 2px 4px rgba(0,0,0,.4);
+    --ground:#0e1417; --ground2:#080c0e;
+    --stone:#171f20; --stone2:#1e2827; --edge:#33403c; --edge-warm:#4a3a2c;
+    --bone:#e9e0cd; --muted:#a39c86; --faint:#726c5c;
+    --gold:#d7a24a; --gold-dim:#9a6f27; --burg:#8f3030; --burg-soft:#a94a45;
+    --moss:#8bbf6a; --blood:#c04b45;
+    --shadow:0 3px 10px rgba(0,0,0,.5);
   }}
   * {{ box-sizing:border-box; }}
   html, body {{ margin:0; }}
   body {{
     background:
-      radial-gradient(1200px 600px at 50% -10%, #1d2831 0%, transparent 60%),
+      radial-gradient(1100px 500px at 50% 0%, #14201f 0%, transparent 60%),
       linear-gradient(180deg, var(--ground) 0%, var(--ground2) 100%);
     background-attachment:fixed;
     color:var(--bone);
-    font-family:"Spectral", Georgia, "Times New Roman", serif;
-    font-size:16px; line-height:1.55;
-    min-height:100vh;
+    font-family:"Alegreya Sans", "Segoe UI", system-ui, sans-serif;
+    font-size:16px; line-height:1.55; min-height:100vh;
   }}
-  .wrap {{ max-width:1080px; margin:0 auto; padding:0 20px 64px; }}
-  a {{ color:var(--rune); }}
+  .wrap {{ max-width:1060px; margin:0 auto; padding:0 20px 64px; }}
+  a {{ color:var(--gold); }}
+  h1, h2, .eyebrow, .tile-label, thead th, .display {{
+    font-family:"IM Fell English SC", "IM Fell English", Georgia, serif;
+    font-weight:400;
+  }}
 
-  /* Header */
-  header {{ text-align:center; padding:48px 0 8px; }}
-  .valknut {{ width:52px; height:48px; color:var(--ember); filter:drop-shadow(0 0 10px rgba(224,161,60,.35)); }}
-  h1 {{
-    font-family:"Cinzel", serif; font-weight:700;
-    font-size:clamp(1.9rem, 5vw, 3rem); letter-spacing:.02em; margin:.2em 0 .1em;
-    text-wrap:balance; color:var(--bone);
-    text-shadow:0 1px 0 #000;
-  }}
-  .eyebrow {{
-    font-family:"Cinzel", serif; text-transform:uppercase; letter-spacing:.32em;
-    font-size:.72rem; color:var(--ember); margin:0;
-  }}
-  .tagline {{ color:var(--muted); margin:.2em 0 0; font-style:italic; }}
+  /* Masthead — the carved banner runs full-bleed and fades into the page */
+  .masthead {{ position:relative; width:100%; height:clamp(96px, 19vw, 196px); overflow:hidden;
+               border-bottom:1px solid var(--edge-warm); }}
+  .masthead img {{ width:100%; height:100%; object-fit:cover; object-position:center; display:block; }}
+  .masthead::after {{ content:""; position:absolute; inset:0; pointer-events:none;
+    background:linear-gradient(180deg, transparent 62%, rgba(14,20,23,.55) 88%, var(--ground) 100%); }}
+  .masthead.nomast {{ display:flex; align-items:center; justify-content:center; background:var(--stone); }}
+  .mast-title {{ font-size:clamp(1.8rem,5vw,3rem); color:var(--gold); margin:0; letter-spacing:.02em; }}
+
+  .subhead {{ text-align:center; padding:20px 0 4px; }}
+  .subhead .eyebrow {{ text-transform:uppercase; letter-spacing:.34em; font-size:.72rem; color:var(--burg-soft); margin:0; }}
+  .subhead .server {{ font-family:"IM Fell English SC", Georgia, serif; font-size:1.5rem; color:var(--bone); margin:.15em 0 0; }}
+  .tagline {{ color:var(--muted); margin:.15em 0 0; font-style:italic; }}
 
   /* Online banner */
-  .online {{
-    margin:28px auto 0; max-width:520px;
+  .online {{ margin:22px auto 0; max-width:520px;
     background:linear-gradient(180deg, var(--stone2), var(--stone));
-    border:1px solid var(--edge); border-radius:10px; padding:16px 20px; box-shadow:var(--shadow);
-  }}
-  .online-head {{ font-family:"Cinzel",serif; font-size:1.05rem; display:flex; align-items:center; gap:10px; justify-content:center; }}
-  .online-head strong {{ color:var(--moss); font-size:1.2rem; }}
+    border:1px solid var(--edge); border-left:3px solid var(--burg); border-radius:6px;
+    padding:15px 20px; box-shadow:var(--shadow); }}
+  .online-head {{ font-family:"IM Fell English SC", Georgia, serif; font-size:1.15rem;
+    display:flex; align-items:center; gap:10px; justify-content:center; }}
+  .online-head strong {{ color:var(--moss); }}
   .online-head.offline {{ color:var(--muted); }}
-  .pip {{ width:9px; height:9px; border-radius:50%; background:var(--moss);
-          box-shadow:0 0 8px var(--moss); flex:none; }}
+  .pip {{ width:9px; height:9px; border-radius:50%; background:var(--moss); box-shadow:0 0 8px var(--moss); flex:none; }}
   .offline .pip {{ background:var(--faint); box-shadow:none; }}
   .online-list {{ list-style:none; margin:12px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }}
-  .online-list li {{ display:flex; align-items:center; gap:10px; font-size:.95rem; }}
+  .online-list li {{ display:flex; align-items:center; gap:10px; font-size:.98rem; }}
   .online-list .name {{ color:var(--bone); }}
   .online-list .since {{ color:var(--faint); font-size:.82rem; margin-left:auto; }}
-  .online-empty {{ text-align:center; color:var(--faint); margin:8px 0 0; font-size:.9rem; }}
+  .online-empty {{ text-align:center; color:var(--faint); margin:8px 0 0; font-size:.92rem; }}
 
   /* Stat tiles */
-  .tiles {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(150px,1fr)); gap:14px; margin:34px 0 10px; }}
-  .tile {{
-    background:var(--stone); border:1px solid var(--edge); border-top:2px solid var(--ember-dim);
-    border-radius:8px; padding:18px 16px; text-align:center;
-  }}
-  .tile-val {{ font-family:"Cinzel",serif; font-weight:700; font-size:2rem; color:var(--ember);
-               font-variant-numeric:tabular-nums; line-height:1.1; }}
-  .tile-label {{ font-family:"Cinzel",serif; text-transform:uppercase; letter-spacing:.1em;
-                 font-size:.72rem; color:var(--bone); margin-top:6px; }}
+  .tiles {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(150px,1fr)); gap:14px; margin:30px 0 10px; }}
+  .tile {{ background:var(--stone); border:1px solid var(--edge); border-top:2px solid var(--gold-dim);
+    border-radius:6px; padding:18px 16px; text-align:center; }}
+  .tile-val {{ font-family:"Alegreya Sans", sans-serif; font-weight:700; font-size:2.1rem; color:var(--gold);
+    font-variant-numeric:tabular-nums; line-height:1.05; }}
+  .tile-label {{ text-transform:uppercase; letter-spacing:.12em; font-size:.82rem; color:var(--bone); margin-top:6px; }}
   .tile-sub {{ color:var(--faint); font-size:.78rem; margin-top:2px; }}
 
   /* Boards */
-  .board-lead {{ margin-top:22px; }}
+  .board-lead {{ margin-top:24px; }}
   .board-lead .bar-col {{ width:52%; }}
   .boards {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(300px,1fr)); gap:22px; margin-top:22px; }}
-  .board {{ background:var(--stone); border:1px solid var(--edge); border-radius:10px; overflow:hidden; box-shadow:var(--shadow); }}
-  .board-head {{ padding:16px 20px 12px; border-bottom:1px solid var(--edge); background:linear-gradient(180deg, var(--stone2), transparent); }}
-  .board-head h2 {{ font-family:"Cinzel",serif; font-weight:600; font-size:1.15rem; margin:0; color:var(--bone); }}
-  .board-head p {{ margin:2px 0 0; color:var(--muted); font-size:.82rem; }}
+  .board {{ background:var(--stone); border:1px solid var(--edge); border-radius:8px; overflow:hidden; box-shadow:var(--shadow); }}
+  .board-head {{ padding:15px 20px 12px; border-bottom:1px solid var(--edge);
+    background:linear-gradient(180deg, rgba(143,48,48,.12), transparent); }}
+  .board-head h2 {{ font-size:1.35rem; margin:0; color:var(--bone); letter-spacing:.01em; }}
+  .board-head p {{ margin:1px 0 0; color:var(--muted); font-size:.84rem; }}
   .table-wrap {{ overflow-x:auto; }}
-  table {{ width:100%; border-collapse:collapse; font-size:.95rem; }}
+  table {{ width:100%; border-collapse:collapse; font-size:.97rem; }}
   th, td {{ padding:10px 20px; text-align:left; }}
-  thead th {{ font-family:"Cinzel",serif; font-weight:500; text-transform:uppercase; letter-spacing:.08em;
-              font-size:.68rem; color:var(--faint); border-bottom:1px solid var(--edge); }}
-  tbody tr {{ border-bottom:1px solid rgba(51,62,73,.5); }}
+  thead th {{ text-transform:uppercase; letter-spacing:.1em; font-size:.74rem; color:var(--faint);
+    border-bottom:1px solid var(--edge); }}
+  tbody tr {{ border-bottom:1px solid rgba(51,64,60,.5); }}
   tbody tr:last-child {{ border-bottom:none; }}
-  tbody tr:nth-child(odd) td {{ background:rgba(255,255,255,.015); }}
+  tbody tr:nth-child(odd) td {{ background:rgba(215,162,74,.03); }}
   .num {{ text-align:right; font-variant-numeric:tabular-nums; }}
-  .rank {{ width:2.4em; color:var(--faint); font-variant-numeric:tabular-nums; font-weight:600; }}
-  .rank.gold {{ color:var(--ember); }}
-  .rank.silver {{ color:#cdd3d9; }}
-  .rank.bronze {{ color:#c08457; }}
+  .rank {{ width:2.4em; color:var(--faint); font-variant-numeric:tabular-nums; font-weight:700; }}
+  .rank.gold {{ color:var(--gold); }}
+  .rank.silver {{ color:#cfc9ba; }}
+  .rank.bronze {{ color:#bd7c4c; }}
   .name {{ color:var(--bone); }}
-  .death-num {{ color:var(--blood); font-weight:600; }}
+  .name-col {{ white-space:nowrap; }}
+  .death-num {{ color:var(--blood); font-weight:700; }}
   .empty {{ color:var(--faint); text-align:center; font-style:italic; padding:22px; }}
 
-  /* Ember bars in the playtime board */
+  /* Gold bars in the playtime board */
   .bar-col {{ width:46%; }}
   .bar-cell {{ position:relative; display:flex; align-items:center; justify-content:flex-end; gap:8px; min-width:120px; }}
-  .bar {{ position:absolute; left:0; top:50%; transform:translateY(-50%); height:60%;
-          background:linear-gradient(90deg, var(--ember-dim), var(--ember)); border-radius:3px; opacity:.35; }}
+  .bar {{ position:absolute; left:0; top:50%; transform:translateY(-50%); height:62%;
+    background:linear-gradient(90deg, var(--gold-dim), var(--gold)); border-radius:2px; opacity:.4; }}
   .bar-val {{ position:relative; z-index:1; font-variant-numeric:tabular-nums; }}
 
   /* Recent activity */
-  .recent {{ margin-top:30px; background:var(--stone); border:1px solid var(--edge); border-radius:10px; padding:18px 22px; }}
-  .recent h2 {{ font-family:"Cinzel",serif; font-weight:600; font-size:1.05rem; margin:0 0 10px; }}
+  .recent {{ margin-top:30px; background:var(--stone); border:1px solid var(--edge); border-radius:8px; padding:18px 22px; }}
+  .recent h2 {{ font-size:1.3rem; margin:0 0 10px; }}
   .feed {{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; }}
-  .ev {{ display:flex; align-items:baseline; gap:8px; padding:7px 0; border-bottom:1px solid rgba(51,62,73,.4); font-size:.92rem; }}
+  .ev {{ display:flex; align-items:baseline; gap:8px; padding:7px 0; border-bottom:1px solid rgba(51,64,60,.4); font-size:.95rem; }}
   .ev:last-child {{ border-bottom:none; }}
   .ev-name {{ color:var(--bone); }}
   .ev-kind {{ color:var(--muted); }}
   .ev.in .ev-kind {{ color:var(--moss); }}
   .ev.out .ev-kind {{ color:var(--faint); }}
   .ev.die .ev-kind {{ color:var(--blood); }}
-  .ev-time {{ margin-left:auto; color:var(--faint); font-size:.8rem; }}
+  .ev-time {{ margin-left:auto; color:var(--faint); font-size:.82rem; }}
 
-  footer {{ text-align:center; color:var(--faint); font-size:.8rem; margin-top:40px; line-height:1.7; }}
+  footer {{ text-align:center; color:var(--faint); font-size:.82rem; margin-top:40px; line-height:1.7; }}
   footer .dot {{ opacity:.5; }}
 
   @media (max-width:520px) {{
@@ -370,11 +381,11 @@ TEMPLATE = """<!doctype html>
 </style>
 </head>
 <body>
+  {masthead}
   <div class="wrap">
-    <header>
-      {valknut}
+    <header class="subhead">
       <p class="eyebrow">Chronicle of</p>
-      <h1>{server_name}</h1>
+      <p class="server">{server_name}</p>
       <p class="tagline">Sagas of the bold, tallies of the fallen &middot; updated live</p>
       <div class="online">{online_html}</div>
     </header>
