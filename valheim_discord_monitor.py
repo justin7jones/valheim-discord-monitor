@@ -60,8 +60,10 @@ RE_CLOSE = re.compile(_TS + r"Closing socket (?P<id>\S+)")
 RE_CONNECT_STEAM = re.compile(_TS + r"Got connection SteamID (?P<id>\S+)")
 RE_CONNECT_PLAYFAB = re.compile(_TS + r"PlayFab listen socket child connected to remote player (?P<id>\S+)")
 RE_PLATFORM_ID = re.compile(_TS + r"PlayFab socket with remote ID playfab/(?P<pf>\S+) received local Platform ID (?P<platform>\S+)")
-RE_JOINED = re.compile(_TS + r"Player joined server \"(?P<server>.*)\".*?(?:now|currently) (?P<count>\d+) player")
-RE_DISCONNECTED = re.compile(_TS + r"Player disconnected from server \"(?P<server>.*)\".*?(?:now|currently) (?P<count>\d+) player")
+# Any line that carries the server's authoritative player count.
+RE_COUNT = re.compile(_TS + r"Player (?:joined|disconnected from|connection lost(?: server)?).*?(?:now|currently) (?P<count>\d+) player")
+RE_CONNECTIONS = re.compile(_TS + r"Connections (?P<count>\d+) ZDOS")
+RE_SERVERNAME = re.compile(r"server \"(?P<server>[^\"]*)\"")
 RE_READY = re.compile(_TS + r"Game server connected")
 RE_TIMEOUT = re.compile(_TS + r"ZRpc timeout detected")
 
@@ -80,43 +82,82 @@ class ParserState:
     dead: set = field(default_factory=set)
     pending_ids: list = field(default_factory=list)  # Steam connection ids not yet paired with a name
     id_to_name: dict = field(default_factory=dict)   # Steam connection id -> name
-    player_count: Optional[int] = None
+    server_count: Optional[int] = None               # authoritative count from the server's own log lines
 
 
 class ValheimLogParser:
+    """
+    Emits named login / logout / death / respawn events from the vanilla console log.
+
+    The player count shown in each message is the server's OWN count (parsed from the
+    "now N player(s)" and "Connections N ZDOS" lines), not a tally of the events we've
+    seen — so it stays correct even for players who were already online when the monitor
+    started, and through crossplay reconnect churn.
+    """
+
     def __init__(self):
         self.s = ParserState()
+
+    def _count(self) -> dict:
+        return {"count": self.s.server_count} if self.s.server_count is not None else {}
 
     def _logout(self, name: str) -> Event:
         owner = self.s.online.pop(name, None)
         self.s.owner_to_name.pop(owner, None)
         self.s.dead.discard(name)
-        return Event("logout", name, {"count": len(self.s.online)})
+        # The authoritative "connection lost ... now N" line follows this one, so our
+        # server_count is still the pre-leave value here; reflect the leave now and let
+        # the next count line reconcile.
+        if self.s.server_count is not None:
+            self.s.server_count = max(0, self.s.server_count - 1)
+        return Event("logout", name, self._count())
 
     def feed(self, line: str) -> Iterator[Event]:
         line = line.rstrip("\r\n")
         if not line:
             return
 
+        # Keep the authoritative count up to date from any line that carries it.
+        m = RE_COUNT.search(line) or RE_CONNECTIONS.search(line)
+        if m:
+            self.s.server_count = int(m.group("count"))
+            # Steady-state truth: if the server says nobody is on, clear our roster.
+            if self.s.server_count == 0 and self.s.online:
+                for name in list(self.s.online):
+                    self.s.online.pop(name, None)
+                self.s.owner_to_name.clear()
+                self.s.dead.clear()
+            return
+
         m = RE_ZDOID.search(line)
         if m:
             name, owner, n = m.group("name").strip(), m.group("owner"), m.group("n")
             if owner == "0" and n == "0":
-                if name in self.s.online and name not in self.s.dead:
+                # A 0:0 ZDOID is a death — fire it even for players who were already
+                # online when the monitor started (we never saw their login).
+                if name not in self.s.dead:
                     self.s.dead.add(name)
                     yield Event("death", name)
                 return
             if name in self.s.dead:
                 self.s.dead.discard(name)
+                # Register the owner id so a later logout can be matched, even for a
+                # player who was already online when the monitor started.
+                self.s.online[name] = owner
+                self.s.owner_to_name[owner] = name
                 yield Event("respawn", name)
                 return
             if name in self.s.online:
+                # Character re-spawn for an already-known player (portal, etc.); refresh
+                # the owner id in case it changed this session.
+                self.s.online[name] = owner
+                self.s.owner_to_name[owner] = name
                 return
             self.s.online[name] = owner
             self.s.owner_to_name[owner] = name
             if self.s.pending_ids:
                 self.s.id_to_name[self.s.pending_ids.pop(0)] = name
-            yield Event("login", name, {"count": len(self.s.online)})
+            yield Event("login", name, self._count())
             return
 
         m = RE_ABANDONED.search(line)
@@ -144,16 +185,6 @@ class ValheimLogParser:
                 yield self._logout(name)
             return
 
-        m = RE_JOINED.search(line) or RE_DISCONNECTED.search(line)
-        if m:
-            self.s.player_count = int(m.group("count"))
-            yield Event("player_count", None, {"count": self.s.player_count, "server": m.group("server")})
-            # If the server says nobody is online, reconcile anything we still think is online.
-            if self.s.player_count == 0:
-                for name in list(self.s.online):
-                    yield self._logout(name)
-            return
-
         if RE_READY.search(line):
             self.s = ParserState()
             yield Event("server_up")
@@ -166,8 +197,8 @@ class ValheimLogParser:
 class Discord:
     COLORS = {"login": 0x57F287, "logout": 0x95A5A6, "death": 0xED4245, "respawn": 0xFEE75C, "server_up": 0x5865F2,
               "player_joined": 0x57F287, "player_left": 0x95A5A6, "server_online": 0x5865F2, "server_offline": 0xED4245}
-    EMOJI = {"login": "🟢", "logout": "⚪", "death": "💀", "respawn": "🔥", "server_up": "🛡️",
-             "player_joined": "🟢", "player_left": "⚪", "server_online": "🛡️", "server_offline": "🔴"}
+    EMOJI = {"login": "🟢", "logout": "🔴", "death": "💀", "respawn": "🔥", "server_up": "🛡️",
+             "player_joined": "🟢", "player_left": "🔴", "server_online": "🛡️", "server_offline": "🔴"}
     DEFAULT_MESSAGES = {
         "login": "**{player}** has arrived in {server}.",
         "logout": "**{player}** has left {server}.",
