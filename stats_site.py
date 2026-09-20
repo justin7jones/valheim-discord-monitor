@@ -249,8 +249,18 @@ def render_html(db_path: str, cfg: dict) -> str:
         prof = r.get("profile_url")
         unlocked, total = r.get("unlocked"), r.get("total")
         if unlocked is None or not total:
-            note = "profile is private" if (r.get("error") == "private") else "no data yet"
-            body = f'<div class="ach-note">Achievements {esc(note)}</div>'
+            # communityvisibilitystate 3 means the *profile* is public, so a blocked
+            # read is the separate "Game details" setting — a single dropdown to flip.
+            # Naming the right setting is what actually gets people to opt in.
+            if r.get("error") == "private":
+                if r.get("visibility") == 3:
+                    note, hint = "Game details are private", "Steam → Privacy Settings → Game details → Public"
+                else:
+                    note, hint = "Profile is private", "Steam → Privacy Settings → My profile → Public"
+            else:
+                note, hint = "No achievement data yet", ""
+            body = (f'<div class="ach-note">{esc(note)}</div>'
+                    + (f'<div class="ach-hint">{esc(hint)}</div>' if hint else ""))
         else:
             pct = round(100 * unlocked / total) if total else 0
             last = ""
@@ -471,6 +481,7 @@ TEMPLATE = """<!doctype html>
   .ach-last {{ color:var(--muted); font-size:.8rem; }}
   .ach-last b {{ color:var(--bone); font-weight:600; }}
   .ach-note {{ color:var(--faint); font-style:italic; font-size:.9rem; margin-top:6px; }}
+  .ach-hint {{ color:var(--faint); font-size:.75rem; margin-top:4px; opacity:.7; letter-spacing:.02em; }}
   .unlock-feed {{ list-style:none; margin:0; padding:0; }}
   .unlock-feed li {{ display:flex; align-items:center; gap:10px; padding:7px 20px;
     border-bottom:1px solid rgba(51,64,60,.4); }}
