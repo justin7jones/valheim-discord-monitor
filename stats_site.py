@@ -23,6 +23,16 @@ from typing import Optional
 
 import stats_db
 
+try:  # icon URL normalisation lives with the rest of the Steam knowledge
+    import steam as _steam
+except Exception:  # noqa: BLE001 - stats_site can be run standalone
+    _steam = None
+
+
+def _ico(url):
+    """Repair an achievement icon URL at render time (fixes rows stored before the fix)."""
+    return _steam.icon_url(url) if (_steam and url) else url
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BANNER = os.path.join(HERE, "assets", "banner.webp")
 
@@ -231,8 +241,11 @@ def render_html(db_path: str, cfg: dict) -> str:
         names = r.get("names") or ""
         chars = ", ".join(dict.fromkeys(n for n in names.split(",") if n and n != persona))
         avatar = r.get("avatar")
-        avatar_html = (f'<img class="ava" src="{esc(avatar)}" alt="" loading="lazy">' if avatar
-                       else '<div class="ava ava-blank"></div>')
+        # a failed avatar collapses to the same blank tile rather than a broken-image glyph
+        avatar_html = (f'<img class="ava" src="{esc(avatar)}" alt="" loading="lazy" '
+                       f'onerror="this.onerror=null;this.className=\'ava ava-blank\';'
+                       f'this.src=\'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==\';">'
+                       if avatar else '<div class="ava ava-blank"></div>')
         prof = r.get("profile_url")
         unlocked, total = r.get("unlocked"), r.get("total")
         if unlocked is None or not total:
@@ -257,7 +270,11 @@ def render_html(db_path: str, cfg: dict) -> str:
         ach_html = f'<div class="ach-grid">{ach_cards}</div>'
         if unlocks:
             items = "".join(
-                (f'<li>' + (f'<img class="ach-ico" src="{esc(u["icon"])}" alt="">' if u.get("icon") else "")
+                (f'<li>' + (f'<img class="ach-ico" src="{esc(_ico(u["icon"]))}" alt="" loading="lazy" '
+                            f'data-fallback="{esc(u["icon"])}" '
+                            f'onerror="if(this.dataset.fallback){{this.src=this.dataset.fallback;'
+                            f'this.dataset.fallback=\'\';}}else{{this.style.display=\'none\';}}">'
+                            if u.get("icon") else "")
                  + f'<span class="ach-uname">{esc(u["name"])}</span>'
                    f'<span class="ach-uwho">{esc(u.get("persona") or "")}</span>'
                    f'<span class="ach-uwhen">{esc(fmt_ago(u["unlocktime"], now))}</span></li>')

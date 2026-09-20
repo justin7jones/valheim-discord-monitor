@@ -29,6 +29,27 @@ API = "https://api.steampowered.com"
 SCHEMA_TTL = 86400  # refresh the achievement catalogue at most once a day
 
 
+ICON_CDN = "https://shared.fastly.steamstatic.com/community_assets/images/apps"
+
+
+def icon_url(url: str, app_id: int = APP_ID) -> str:
+    """Rebuild an achievement icon URL into the form Steam actually serves today.
+
+    GetSchemaForGame still returns icons under the retired host
+    steamcdn-a.akamaihd.net with the old path /steamcommunity/public/images/apps/…,
+    which now 404s. The same asset hash is served from
+    shared.fastly.steamstatic.com/community_assets/images/apps/<appid>/<hash>.jpg,
+    so keep the filename and rebuild the rest. Unrecognised values pass through.
+    """
+    if not url or not isinstance(url, str):
+        return url
+    name = url.rsplit("/", 1)[-1].split("?")[0].strip()
+    # Only rewrite things that look like Steam's <sha1>.jpg asset names.
+    if not name or "." not in name:
+        return url
+    return f"{ICON_CDN}/{app_id}/{name}"
+
+
 def _get(path: str, params: dict, timeout: float = 20.0):
     url = f"{API}{path}?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": "valheim-discord-monitor/1.0"})
@@ -38,7 +59,12 @@ def _get(path: str, params: dict, timeout: float = 20.0):
 
 def fetch_schema(key: str) -> list:
     d = _get("/ISteamUserStats/GetSchemaForGame/v2/", {"key": key, "appid": APP_ID, "l": "english"})
-    return (((d or {}).get("game") or {}).get("availableGameStats") or {}).get("achievements") or []
+    ach = (((d or {}).get("game") or {}).get("availableGameStats") or {}).get("achievements") or []
+    for a in ach:  # normalise the CDN URLs before they reach the database
+        for k in ("icon", "icongray"):
+            if a.get(k):
+                a[k] = icon_url(a[k])
+    return ach
 
 
 def fetch_summaries(key: str, steam_ids: list) -> dict:
