@@ -38,6 +38,12 @@
       "server_up": "{server} is online."
     }
   },
+  "steam": {
+    "enabled": true,
+    "api_key": "YOUR-STEAM-WEB-API-KEY-OR-USE-STEAM_API_KEY-ENV",
+    "refresh_seconds": 1800,
+    "top_n": 25
+  },
   "source": {
     "type": "a2s",
     "host": "YOUR.SERVER.IP",

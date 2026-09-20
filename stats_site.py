@@ -146,6 +146,8 @@ def render_html(db_path: str, cfg: dict) -> str:
         srv = stats_db.server_stats(conn)
         online = stats_db.currently_online(conn)
         recent = stats_db.recent_activity(conn, 12)
+        ach = stats_db.achievements_leaderboard(conn, top_n)
+        unlocks = stats_db.recent_unlocks(conn, 12)
         last_event = conn.execute("SELECT value FROM meta WHERE key='last_event_at'").fetchone()
     finally:
         conn.close()
@@ -223,6 +225,49 @@ def render_html(db_path: str, cfg: dict) -> str:
         f'<span class="ev-time">{esc(fmt_ago(r["at"], now))}</span></li>'
         for r in recent) or '<li class="ev empty">Nothing has happened yet.</li>'
 
+    # --- achievements tab ---
+    def ach_card(r):
+        persona = r.get("persona") or (r.get("names") or "").split(",")[0] or "Unknown viking"
+        names = r.get("names") or ""
+        chars = ", ".join(dict.fromkeys(n for n in names.split(",") if n and n != persona))
+        avatar = r.get("avatar")
+        avatar_html = (f'<img class="ava" src="{esc(avatar)}" alt="" loading="lazy">' if avatar
+                       else '<div class="ava ava-blank"></div>')
+        prof = r.get("profile_url")
+        unlocked, total = r.get("unlocked"), r.get("total")
+        if unlocked is None or not total:
+            note = "profile is private" if (r.get("error") == "private") else "no data yet"
+            body = f'<div class="ach-note">Achievements {esc(note)}</div>'
+        else:
+            pct = round(100 * unlocked / total) if total else 0
+            last = ""
+            if r.get("last_unlock_name"):
+                last = (f'<div class="ach-last">Latest: <b>{esc(r["last_unlock_name"])}</b> '
+                        f'· {esc(fmt_date(r.get("last_unlock_at")))}</div>')
+            body = (f'<div class="ach-count"><b>{unlocked}</b> / {total} '
+                    f'<span class="ach-pct">{pct}%</span></div>'
+                    f'<div class="ach-bar"><span style="width:{pct}%"></span></div>{last}')
+        name_line = (f'<a class="ach-name" href="{esc(prof)}" target="_blank" rel="noopener">{esc(persona)}</a>'
+                     if prof else f'<span class="ach-name">{esc(persona)}</span>')
+        char_line = f'<div class="ach-char">as {esc(chars)}</div>' if chars else ""
+        return f'<div class="ach-card">{avatar_html}<div class="ach-body">{name_line}{char_line}{body}</div></div>'
+
+    if ach:
+        ach_cards = "".join(ach_card(r) for r in ach)
+        ach_html = f'<div class="ach-grid">{ach_cards}</div>'
+        if unlocks:
+            items = "".join(
+                (f'<li>' + (f'<img class="ach-ico" src="{esc(u["icon"])}" alt="">' if u.get("icon") else "")
+                 + f'<span class="ach-uname">{esc(u["name"])}</span>'
+                   f'<span class="ach-uwho">{esc(u.get("persona") or "")}</span>'
+                   f'<span class="ach-uwhen">{esc(fmt_ago(u["unlocktime"], now))}</span></li>')
+                for u in unlocks)
+            ach_html += (f'<section class="board recent"><div class="board-head"><h2>Recent Unlocks</h2>'
+                         f'<p>Latest achievements earned</p></div><ul class="unlock-feed">{items}</ul></section>')
+    else:
+        ach_html = ('<div class="empty-tab">No Steam achievements yet. They appear here as Steam '
+                    'players connect and their public profiles are read.</div>')
+
     refresh = int((cfg.get("stats_site") or {}).get("refresh_seconds", 120))
     updated = fmt_datetime(now)
 
@@ -243,6 +288,7 @@ def render_html(db_path: str, cfg: dict) -> str:
         visit_board=visit_board,
         longest_board=longest_board,
         recent=recent_html,
+        achievements=ach_html,
         updated=esc(updated),
         tz_label=esc(tz_label),
         refresh=refresh,
@@ -378,10 +424,52 @@ TEMPLATE = """<!doctype html>
   footer {{ text-align:center; color:var(--faint); font-size:.82rem; margin-top:40px; line-height:1.7; }}
   footer .dot {{ opacity:.5; }}
 
+  /* Tabs */
+  .tabs {{ display:flex; gap:6px; justify-content:center; margin:26px 0 4px; flex-wrap:wrap; }}
+  .tab-btn {{ font-family:"IM Fell English SC", Georgia, serif; font-size:1rem; letter-spacing:.02em;
+    color:var(--muted); background:var(--stone); border:1px solid var(--edge); border-bottom:none;
+    border-radius:7px 7px 0 0; padding:10px 20px; cursor:pointer; }}
+  .tab-btn:hover {{ color:var(--bone); }}
+  .tab-btn[aria-selected="true"] {{ color:var(--gold); background:var(--stone2);
+    border-color:var(--gold-dim); box-shadow:0 -2px 0 var(--gold-dim) inset; }}
+  .tab-rule {{ height:1px; background:var(--edge); margin:0 0 22px; }}
+  .tab-panel[hidden] {{ display:none; }}
+
+  /* Achievements */
+  .ach-grid {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(300px,1fr)); gap:16px; }}
+  .ach-card {{ display:flex; gap:14px; background:var(--stone); border:1px solid var(--edge);
+    border-top:2px solid var(--gold-dim); border-radius:8px; padding:16px; }}
+  .ava {{ width:56px; height:56px; border-radius:6px; flex:none; background:var(--stone2); object-fit:cover; }}
+  .ava-blank {{ border:1px solid var(--edge); }}
+  .ach-body {{ flex:1; min-width:0; }}
+  .ach-name {{ font-family:"IM Fell English SC", Georgia, serif; font-size:1.2rem; color:var(--bone);
+    text-decoration:none; }}
+  a.ach-name:hover {{ color:var(--gold); }}
+  .ach-char {{ color:var(--faint); font-size:.8rem; margin:1px 0 8px; }}
+  .ach-count {{ font-variant-numeric:tabular-nums; color:var(--bone); }}
+  .ach-count b {{ color:var(--gold); font-size:1.15rem; }}
+  .ach-pct {{ color:var(--muted); font-size:.85rem; margin-left:4px; }}
+  .ach-bar {{ height:7px; background:var(--ground); border-radius:4px; overflow:hidden; margin:7px 0; }}
+  .ach-bar span {{ display:block; height:100%; background:linear-gradient(90deg, var(--gold-dim), var(--gold)); }}
+  .ach-last {{ color:var(--muted); font-size:.8rem; }}
+  .ach-last b {{ color:var(--bone); font-weight:600; }}
+  .ach-note {{ color:var(--faint); font-style:italic; font-size:.9rem; margin-top:6px; }}
+  .unlock-feed {{ list-style:none; margin:0; padding:0; }}
+  .unlock-feed li {{ display:flex; align-items:center; gap:10px; padding:7px 20px;
+    border-bottom:1px solid rgba(51,64,60,.4); }}
+  .unlock-feed li:last-child {{ border-bottom:none; }}
+  .ach-ico {{ width:26px; height:26px; border-radius:4px; flex:none; }}
+  .ach-uname {{ color:var(--bone); }}
+  .ach-uwho {{ color:var(--muted); font-size:.85rem; }}
+  .ach-uwhen {{ margin-left:auto; color:var(--faint); font-size:.8rem; }}
+  .empty-tab {{ text-align:center; color:var(--faint); font-style:italic; padding:40px 20px;
+    background:var(--stone); border:1px solid var(--edge); border-radius:8px; }}
+
   @media (max-width:520px) {{
     .hide-sm {{ display:none; }}
     th, td {{ padding:9px 14px; }}
     .wrap {{ padding:0 14px 48px; }}
+    .tab-btn {{ padding:9px 14px; font-size:.92rem; }}
   }}
   @media (prefers-reduced-motion:reduce) {{ * {{ scroll-behavior:auto; }} }}
 </style>
@@ -396,26 +484,57 @@ TEMPLATE = """<!doctype html>
       <div class="online">{online_html}</div>
     </header>
 
-    <div class="tiles">{tiles}</div>
-
-    <div class="board-lead">{play_board}</div>
-
-    <div class="boards">
-      {death_board}
-      {longest_board}
-      {visit_board}
+    <div class="tabs" role="tablist">
+      <button class="tab-btn" role="tab" data-tab="server" aria-selected="true">Server</button>
+      <button class="tab-btn" role="tab" data-tab="vikings" aria-selected="false">Vikings</button>
+      <button class="tab-btn" role="tab" data-tab="achievements" aria-selected="false">Achievements</button>
     </div>
+    <div class="tab-rule"></div>
 
-    <div class="recent">
-      <h2>Recent Deeds</h2>
-      <ul class="feed">{recent}</ul>
-    </div>
+    <section class="tab-panel" data-panel="server">
+      <div class="tiles">{tiles}</div>
+      <div class="recent">
+        <h2>Recent Deeds</h2>
+        <ul class="feed">{recent}</ul>
+      </div>
+    </section>
+
+    <section class="tab-panel" data-panel="vikings" hidden>
+      <div class="board-lead">{play_board}</div>
+      <div class="boards">
+        {death_board}
+        {longest_board}
+        {visit_board}
+      </div>
+    </section>
+
+    <section class="tab-panel" data-panel="achievements" hidden>
+      {achievements}
+    </section>
 
     <footer>
       Updated {updated} ({tz_label}) &middot; last activity {last_event_ago}<br>
       <span class="dot">Refreshes automatically &middot; {year}</span>
     </footer>
   </div>
+  <script>
+    (function() {{
+      var btns = Array.prototype.slice.call(document.querySelectorAll('.tab-btn'));
+      var panels = Array.prototype.slice.call(document.querySelectorAll('.tab-panel'));
+      function show(name) {{
+        btns.forEach(function(b) {{ b.setAttribute('aria-selected', b.dataset.tab === name); }});
+        panels.forEach(function(p) {{ p.hidden = (p.dataset.panel !== name); }});
+      }}
+      btns.forEach(function(b) {{
+        b.addEventListener('click', function() {{
+          show(b.dataset.tab);
+          try {{ history.replaceState(null, '', '#' + b.dataset.tab); }} catch (e) {{ location.hash = b.dataset.tab; }}
+        }});
+      }});
+      var start = (location.hash || '').replace('#', '');
+      if (['server','vikings','achievements'].indexOf(start) >= 0) show(start);
+    }})();
+  </script>
 </body>
 </html>"""
 

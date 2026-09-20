@@ -191,6 +191,55 @@ The page is static HTML — no scripts, no inputs, no auth needed — so it is s
 host publicly. **Full deployment (DNS, nginx/Caddy, backfill): see
 [DEPLOY_STATS.md](DEPLOY_STATS.md).**
 
+The page is laid out as three tabs (client-side, no server round-trip): **Server**
+(totals + recent activity), **Vikings** (the play/death/longest/visits
+leaderboards), and **Achievements** (below). The active tab is remembered in the
+URL hash so a refresh keeps you where you were.
+
+## Steam achievements
+
+For players who connect through **Steam** (not Xbox/GamePass), the monitor can
+show their public Valheim achievement progress on the page — an Achievements tab
+with a card per player (avatar, unlocked/total, a progress bar, their latest
+unlock) plus a "Recent Unlocks" feed across everyone.
+
+How the link is made: nothing to configure per player. When a Steam player
+connects, the server log carries a handshake line
+(`PlayFab socket … received local Platform ID Steam_7656…`) that the monitor
+correlates to that player's character login, storing the character↔SteamID
+mapping. A background refresh then pulls, from the **public** Steam Web API:
+
+- the game's achievement catalogue once a day (names/icons) — `GetSchemaForGame`
+- each player's profile (persona, avatar) — `GetPlayerSummaries`
+- each player's unlocked achievements — `GetPlayerAchievements`
+
+Enable it with a `steam` block in `config.json`:
+```json
+"steam": { "enabled": true, "api_key": "…", "refresh_seconds": 1800, "top_n": 25 }
+```
+Leave `api_key` out and set the `STEAM_API_KEY` environment variable instead
+(the same free key the `steamapi` source uses, from
+<https://steamcommunity.com/dev/apikey>). With more than `top_n` linked players
+the most-recently-seen ones are refreshed. The refresh runs on its own slow
+cadence (`refresh_seconds`, 30 min default) to stay well within API limits,
+independent of the page render.
+
+```bash
+python3 valheim_discord_monitor.py --config config.json --refresh-steam   # fetch once, render, exit
+python3 steam.py --db valheim_stats.db --key $STEAM_API_KEY                # standalone refresh
+```
+
+Notes:
+- **Only Steam players appear.** Xbox/GamePass players never send a Steam
+  Platform ID, so they can't be linked — this is a Steam-only feature.
+- **A player must make their profile (and game details) public** for
+  achievements to show. Steam defaults game details to public, but a private
+  profile is stored with a "profile is private" note on the card so they know to
+  flip the setting, rather than being hidden.
+- Links populate **going forward**, as Steam players connect — historical logins
+  can't be backfilled because old logs were filtered to event lines and no longer
+  carry the handshake.
+
 ## Running it permanently
 
 **Docker**
@@ -227,6 +276,10 @@ or run it in a terminal.
 | `poll_interval_seconds` | 15 | How often to poll. |
 | `source.offline_after` | 3 | Count mode: failed queries in a row before "offline". |
 | `source.api_key` | — | `steamapi` only; or `STEAM_API_KEY` env var. |
+| `steam.enabled` | false | Pull public Steam achievements onto the page. |
+| `steam.api_key` | — | Steam Web API key; or `STEAM_API_KEY` env var. |
+| `steam.refresh_seconds` | 1800 | How often to refresh Steam data. |
+| `steam.top_n` | 25 | Most-recently-seen linked players to refresh. |
 | `discord.embeds` | true | Coloured embed vs plain text. |
 | `discord.show_player_count` | true | Footer with the current online count. |
 | `discord.messages` | see example | Per-event templates; `{player}`, `{server}`, `{who}`, `{count}`, `{max}` placeholders. |

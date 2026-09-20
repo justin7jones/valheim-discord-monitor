@@ -77,6 +77,47 @@ def init_schema(conn: sqlite3.Connection) -> None:
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+
+        -- Steam achievements ---------------------------------------------------
+        -- character name (from the log) -> SteamID64 (from the log handshake line)
+        CREATE TABLE IF NOT EXISTS player_steam (
+            player     TEXT PRIMARY KEY,
+            steam_id   TEXT NOT NULL,
+            updated_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS ix_player_steam_id ON player_steam(steam_id);
+
+        -- per-SteamID profile + achievement summary (filled by the Steam Web API)
+        CREATE TABLE IF NOT EXISTS steam_profile (
+            steam_id         TEXT PRIMARY KEY,
+            persona          TEXT,
+            avatar           TEXT,
+            profile_url      TEXT,
+            visibility       INTEGER,   -- 3 = public; anything else = we couldn't read stats
+            unlocked         INTEGER,
+            total            INTEGER,
+            last_unlock_at   INTEGER,
+            last_unlock_name TEXT,
+            updated_at       INTEGER,
+            error            TEXT
+        );
+
+        -- the game's achievement catalogue (names/descriptions/icons), fetched once
+        CREATE TABLE IF NOT EXISTS steam_schema (
+            apiname     TEXT PRIMARY KEY,
+            name        TEXT,
+            description TEXT,
+            icon        TEXT,
+            icongray    TEXT
+        );
+
+        -- unlocked achievements per player (for "recent unlocks")
+        CREATE TABLE IF NOT EXISTS steam_unlock (
+            steam_id   TEXT NOT NULL,
+            apiname    TEXT NOT NULL,
+            unlocktime INTEGER,
+            PRIMARY KEY (steam_id, apiname)
+        );
         """
     )
     conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
@@ -180,6 +221,54 @@ class Store:
         self._touch(ts)
         self.conn.commit()
 
+    def link_steam(self, player: str, steam_id: str, ts: int) -> None:
+        """Record the character name -> SteamID64 mapping seen in the log handshake."""
+        self.conn.execute(
+            "INSERT INTO player_steam(player, steam_id, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(player) DO UPDATE SET steam_id=excluded.steam_id, updated_at=excluded.updated_at",
+            (player, steam_id, ts))
+        self.conn.commit()
+
+    # -- Steam Web API writers (called by steam.py) ------------------------
+    def steam_ids_to_update(self, limit: Optional[int] = None):
+        """SteamIDs we know about, most-recently-active first (by their players' play)."""
+        sql = ("SELECT ps.steam_id, MAX(COALESCE(s.logout_at, s.last_seen_at, 0)) AS last_seen "
+               "FROM player_steam ps LEFT JOIN play_sessions s ON s.player = ps.player "
+               "GROUP BY ps.steam_id ORDER BY last_seen DESC")
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return [r["steam_id"] for r in self.conn.execute(sql).fetchall()]
+
+    def save_schema(self, achievements: list) -> None:
+        for a in achievements:
+            self.conn.execute(
+                "INSERT INTO steam_schema(apiname, name, description, icon, icongray) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(apiname) DO UPDATE SET name=excluded.name, description=excluded.description, "
+                "icon=excluded.icon, icongray=excluded.icongray",
+                (a.get("name"), a.get("displayName"), a.get("description"), a.get("icon"), a.get("icongray")))
+        self._set_meta("steam_schema_at", int(time.time()))
+        self.conn.commit()
+
+    def save_profile(self, steam_id: str, **f) -> None:
+        cols = ("persona", "avatar", "profile_url", "visibility", "unlocked", "total",
+                "last_unlock_at", "last_unlock_name", "error")
+        vals = [f.get(c) for c in cols]
+        self.conn.execute(
+            f"INSERT INTO steam_profile(steam_id, {', '.join(cols)}, updated_at) "
+            f"VALUES (?{', ?' * len(cols)}, ?) "
+            f"ON CONFLICT(steam_id) DO UPDATE SET "
+            + ", ".join(f"{c}=excluded.{c}" for c in cols) + ", updated_at=excluded.updated_at",
+            (steam_id, *vals, int(time.time())))
+        self.conn.commit()
+
+    def save_unlocks(self, steam_id: str, unlocks: list) -> None:
+        """unlocks: list of (apiname, unlocktime). Replaces this player's unlock set."""
+        self.conn.execute("DELETE FROM steam_unlock WHERE steam_id=?", (steam_id,))
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO steam_unlock(steam_id, apiname, unlocktime) VALUES (?,?,?)",
+            [(steam_id, a, t) for a, t in unlocks])
+        self.conn.commit()
+
     def concurrency(self, count: int, ts: int) -> None:
         last = self.conn.execute("SELECT count FROM concurrency ORDER BY at DESC, id DESC LIMIT 1").fetchone()
         if last is None or last["count"] != count:
@@ -269,3 +358,28 @@ def recent_activity(conn, limit: int = 15):
         UNION ALL SELECT player, logout_at AS at, 'logout' FROM play_sessions WHERE logout_at IS NOT NULL
         UNION ALL SELECT player, died_at AS at, 'death' FROM deaths
         ORDER BY at DESC LIMIT ?""", (limit,))
+
+
+def achievements_leaderboard(conn, limit: int = 10):
+    """One row per Steam-linked player, most achievements first. `names` groups every
+    character name seen for that SteamID (players often reuse one account)."""
+    rows = _rows(conn, """
+        SELECT p.steam_id,
+               p.persona, p.avatar, p.profile_url, p.visibility,
+               p.unlocked, p.total, p.last_unlock_at, p.last_unlock_name, p.updated_at, p.error,
+               (SELECT GROUP_CONCAT(DISTINCT player) FROM player_steam WHERE steam_id = p.steam_id) AS names
+        FROM steam_profile p
+        ORDER BY p.unlocked DESC, p.total DESC, p.updated_at DESC
+        LIMIT ?""", (limit,))
+    return rows
+
+
+def recent_unlocks(conn, limit: int = 12):
+    return _rows(conn, """
+        SELECT u.steam_id, u.apiname, u.unlocktime,
+               COALESCE(sc.name, u.apiname) AS name, sc.icon,
+               (SELECT persona FROM steam_profile WHERE steam_id = u.steam_id) AS persona
+        FROM steam_unlock u
+        LEFT JOIN steam_schema sc ON sc.apiname = u.apiname
+        WHERE u.unlocktime > 0
+        ORDER BY u.unlocktime DESC LIMIT ?""", (limit,))

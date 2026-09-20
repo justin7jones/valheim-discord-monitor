@@ -102,6 +102,7 @@ class ParserState:
     dead: set = field(default_factory=set)
     pending_ids: list = field(default_factory=list)  # Steam connection ids not yet paired with a name
     id_to_name: dict = field(default_factory=dict)   # Steam connection id -> name
+    id_to_steam: dict = field(default_factory=dict)  # connection id -> SteamID64 (crossplay handshake)
     server_count: Optional[int] = None               # authoritative count from the server's own log lines
     down: bool = False                               # True after a shutdown, until the next boot
 
@@ -207,9 +208,15 @@ class ValheimLogParser:
                 return
             self.s.online[name] = owner
             self.s.owner_to_name[owner] = name
+            steam_id = None
             if self.s.pending_ids:
-                self.s.id_to_name[self.s.pending_ids.pop(0)] = name
-            yield Event("login", name, self._count())
+                cid = self.s.pending_ids.pop(0)
+                self.s.id_to_name[cid] = name
+                steam_id = self.s.id_to_steam.get(cid) or (cid if cid.startswith("7656") and cid.isdigit() else None)
+            extra = self._count()
+            if steam_id:
+                extra["steam_id"] = steam_id
+            yield Event("login", name, extra)
             return
 
         m = RE_ABANDONED.search(line)
@@ -217,6 +224,14 @@ class ValheimLogParser:
             name = self.s.owner_to_name.get(m.group("owner"))
             if name:
                 yield self._logout(name)
+            return
+
+        # Crossplay handshake: maps a PlayFab connection id to the player's SteamID64.
+        m = RE_PLATFORM_ID.search(line)
+        if m:
+            platform = m.group("platform")
+            if platform.startswith("Steam_"):
+                self.s.id_to_steam[m.group("pf")] = platform[len("Steam_"):]
             return
 
         m = RE_CONNECT_STEAM.search(line) or RE_CONNECT_PLAYFAB.search(line)
@@ -756,6 +771,11 @@ def record_event(store, ev: "Event") -> None:
         return
     if ev.kind == "login":
         store.login(ev.player, ts)
+        if ev.extra.get("steam_id"):
+            try:
+                store.link_steam(ev.player, ev.extra["steam_id"], ts)
+            except Exception as e:
+                log.warning("steam link failed for %s: %s", ev.player, e)
     elif ev.kind == "logout":
         (store.logout_stale if ev.extra.get("stale") else store.logout)(ev.player, ts)
     elif ev.kind == "death":
@@ -792,6 +812,7 @@ def main():
     ap.add_argument("--from-start", action="store_true", help="On first run, process the whole existing log instead of only new lines")
     ap.add_argument("--backfill", metavar="FILE", help="Load a whole log file into the stats database (no Discord posts), then exit")
     ap.add_argument("--render-site", action="store_true", help="Render the stats web page from the database once and exit")
+    ap.add_argument("--refresh-steam", action="store_true", help="Fetch Steam achievements for known players once, then exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -828,6 +849,21 @@ def main():
         if not (db_enabled and site_cfg.get("output")):
             sys.exit("Configure database.path and stats_site.output first")
         render_site("(--render-site)")
+        return
+
+    if args.refresh_steam:
+        if not db_enabled:
+            sys.exit("Configure a database.path first")
+        key = os.environ.get("STEAM_API_KEY") or (cfg.get("steam") or {}).get("api_key") \
+            or cfg.get("source", {}).get("api_key")
+        if not key:
+            sys.exit("Set STEAM_API_KEY or steam.api_key")
+        import steam
+        store = open_store()
+        n = steam.update_all(store, key, limit=int((cfg.get("steam") or {}).get("top_n", 25)))
+        store.close()
+        print(f"Refreshed {n} Steam profile(s)")
+        render_site("(after steam refresh)")
         return
 
     if args.backfill:
@@ -911,6 +947,24 @@ def main():
     store = open_store() if db_enabled else None
     render_interval = float(site_cfg.get("render_interval_seconds", 60))
     last_render = 0.0
+
+    # Steam achievements: refresh in the background on its own (slow) cadence.
+    steam_cfg = cfg.get("steam") or {}
+    steam_key = os.environ.get("STEAM_API_KEY") or steam_cfg.get("api_key") or cfg.get("source", {}).get("api_key")
+    steam_enabled = bool(store) and steam_cfg.get("enabled", bool(steam_key)) and bool(steam_key)
+    steam_interval = float(steam_cfg.get("refresh_seconds", 1800))
+    steam_limit = int(steam_cfg.get("top_n", 25))
+    last_steam = 0.0
+
+    def refresh_steam():
+        try:
+            import steam
+            n = steam.update_all(store, steam_key, limit=steam_limit)
+            if n:
+                render_site("(steam refresh)")
+        except Exception as e:
+            log.warning("Steam refresh failed: %s", e)
+
     # If a shutdown isn't followed by a boot within this window, treat it as offline
     # (vs a quick restart that comes back) and post the offline message once.
     offline_grace = float(cfg.get("offline_grace_seconds", 300))
@@ -950,6 +1004,9 @@ def main():
             if changed and store and site_cfg.get("output") and now - last_render >= render_interval:
                 render_site()
                 last_render = now
+            if steam_enabled and now - last_steam >= steam_interval:
+                refresh_steam()
+                last_steam = now
         except KeyboardInterrupt:
             log.info("Stopping")
             if store:
