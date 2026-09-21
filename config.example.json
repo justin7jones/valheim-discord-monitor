@@ -44,6 +44,25 @@
     "refresh_seconds": 1800,
     "top_n": 25
   },
+  "maintenance": {
+    "enabled": false,
+    "api_key": "YOUR-lowms_-KEY-OR-USE-LOWMS_API_KEY-ENV",
+    "check_interval_seconds": 900,
+    "timezone": "America/Los_Angeles",
+    "count_max_age_seconds": 780,
+    "dry_run": false,
+    "notify": true,
+    "state_file": "maintenance_state.json",
+    "update": {
+      "enabled": true
+    },
+    "backup": {
+      "enabled": true,
+      "window": "02:00-06:00",
+      "stop_server": true,
+      "delete_oldest_when_full": true
+    }
+  },
   "source": {
     "type": "a2s",
     "host": "YOUR.SERVER.IP",

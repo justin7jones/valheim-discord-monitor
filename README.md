@@ -119,7 +119,10 @@ support, Sept 2026) — use count mode there.
 The panel's Console tab reads the live log from
 `GET https://api.prod.nexus.low.ms/user/servers/<id>/daemon/console?lines=N`
 using the panel's own Auth0 session token (the public `lowms_…` API keys are
-rejected there, and the public API has no console-read endpoint). The `nexus`
+rejected there). *Note:* LOW.MS's public API has since added
+`GET /v1/servers/{id}/console` (scope `console:read`), which could replace this
+browser sign-in for reading the log; the panel session is still needed for game
+updates, which the public API doesn't offer. The `nexus`
 source signs in to the panel **with your own account** through a headless
 browser, captures that token, caches it, and signs in again whenever it
 expires or is rejected — so you get the full log, and with it named login /
@@ -240,6 +243,55 @@ Notes:
   can't be backfilled because old logs were filtered to event lines and no longer
   carry the handshake.
 
+## Unattended updates & nightly backups (LOW.MS)
+
+With a `maintenance` block, the monitor keeps the server patched and backed up
+**only while nobody is playing**. Every 15 minutes (`check_interval_seconds`):
+
+1. **Is it empty?** Valheim writes `Connections N ZDOS` to its log every 10
+   minutes. The server counts as empty only when that line is recent (under
+   `count_max_age_seconds`, 13 min), reads `0`, nobody has logged in since, and the
+   monitor tracks nobody online. A stale or missing count means *not empty*, so a
+   dropped log feed never looks like an empty server. After the monitor restarts, it
+   waits for a fresh count before doing anything.
+2. **Backup:** inside the `backup.window` (02:00–06:00 in `timezone`, default
+   `America/Los_Angeles` — the panel's own clock) and not yet done that night:
+   **stop → back up → start**. LOW.MS notes that a backup of a running server skips
+   any file Valheim has locked, so it stops first. When the backup allowance is full,
+   the oldest *unpinned* backup is deleted and the backup retried
+   (`delete_oldest_when_full`).
+3. **Update:** if the panel reports an update waiting, install it immediately. If a
+   backup is also due, the order is stop → backup → update → start, so every update
+   has a fresh backup taken just before it.
+
+The server is **always started again** afterwards, even when a step fails. Discord
+gets one "down for maintenance" line and one "finished" (or "had a problem") line;
+the usual "restarting / back online / offline" posts for that restart are held
+back. A real crash afterwards still alerts normally, and if the server doesn't come
+back, the "offline" alert still fires once the quiet period ends.
+
+**Which API does what.** Backups, stop/start and job status use the documented
+[LOW.MS Public API](https://api.prod.nexus.low.ms/v1/docs) with a `lowms_` key.
+The public API has **no update endpoint**, so the update check (`update-info`) and
+install (`update_server`) use the same private panel endpoints as the panel's own
+**Update** button, through the monitor's signed-in panel session (the `nexus`
+source's `login`). If LOW.MS changes those, updates stop and log a warning while
+backups carry on.
+
+Setup:
+1. Panel → Account → **API Keys**: create a key with scopes `backups:read`,
+   `backups:write`, `servers:power`, pinned to this server.
+2. Put it in the environment (`LOWMS_API_KEY`) or `maintenance.api_key`, and set
+   `"enabled": true` in the `maintenance` block (see `config.example.json`).
+3. Check it (read-only: verifies the key's scopes, lists backups, shows update
+   status and whether it's inside the window):
+   ```bash
+   python3 valheim_discord_monitor.py --config config.json --maintenance-check
+   ```
+4. Optional first night: `"dry_run": true` logs what it *would* do without doing it.
+5. Turn **off** LOW.MS's own *Update* / *Backup* scheduled tasks (Settings →
+   Scheduled tasks), which run whether or not anyone is online.
+
 ## Running it permanently
 
 **Docker**
@@ -280,6 +332,15 @@ or run it in a terminal.
 | `steam.api_key` | — | Steam Web API key; or `STEAM_API_KEY` env var. |
 | `steam.refresh_seconds` | 1800 | How often to refresh Steam data. |
 | `steam.top_n` | 25 | Most-recently-seen linked players to refresh. |
+| `maintenance.enabled` | false | Unattended updates + nightly backups (LOW.MS). |
+| `maintenance.api_key` | — | `lowms_` key; or `LOWMS_API_KEY` env var. |
+| `maintenance.check_interval_seconds` | 900 | How often to check (only acts when empty). |
+| `maintenance.timezone` | America/Los_Angeles | Clock for the backup window. |
+| `maintenance.backup.window` | 02:00-06:00 | Nightly backup window (once per night). |
+| `maintenance.backup.stop_server` | true | Stop the server for a consistent backup. |
+| `maintenance.backup.delete_oldest_when_full` | true | Delete the oldest unpinned backup when the allowance is full. |
+| `maintenance.update.enabled` | true | Install game updates as soon as one is waiting. |
+| `maintenance.dry_run` | false | Log the plan without doing anything. |
 | `discord.embeds` | true | Coloured embed vs plain text. |
 | `discord.show_player_count` | true | Footer with the current online count. |
 | `discord.messages` | see example | Per-event templates; `{player}`, `{server}`, `{who}`, `{count}`, `{max}` placeholders. |

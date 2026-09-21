@@ -279,10 +279,12 @@ class _SafeDict(dict):
 class Discord:
     COLORS = {"login": 0x57F287, "logout": 0x95A5A6, "death": 0xED4245, "respawn": 0xFEE75C, "server_up": 0x5865F2,
               "player_joined": 0x57F287, "player_left": 0x95A5A6, "server_online": 0x57F287, "server_offline": 0xED4245,
-              "server_restart": 0xE0A13C}
+              "server_restart": 0xE0A13C, "maintenance_start": 0x5865F2, "maintenance_done": 0x57F287,
+              "maintenance_failed": 0xED4245}
     EMOJI = {"login": "🟢", "logout": "🔴", "death": "💀", "respawn": "🔥", "server_up": "🛡️",
              "player_joined": "🟢", "player_left": "🔴", "server_online": "🟢", "server_offline": "🔴",
-             "server_restart": "🔻"}
+             "server_restart": "🔻", "maintenance_start": "🛠️", "maintenance_done": "✅",
+             "maintenance_failed": "⚠️"}
     DEFAULT_MESSAGES = {
         "login": "**{player}** has arrived in {server}.",
         "logout": "**{player}** has left {server}.",
@@ -295,6 +297,10 @@ class Discord:
         # Count-only events (a2s source): no names available.
         "player_joined": "{who} arrived in {server}. **{count}/{max}** online.",
         "player_left": "{who} left {server}. **{count}/{max}** online.",
+        # Unattended maintenance (maintenance.py) — only runs while nobody is online.
+        "maintenance_start": "**{server}** is down for maintenance: {detail}.",
+        "maintenance_done": "**{server}** maintenance finished: {detail}.",
+        "maintenance_failed": "**{server}** maintenance had a problem: {detail}",
     }
 
     def __init__(self, webhook_url: str, username: str = "Valheim", show_count: bool = True,
@@ -764,6 +770,42 @@ def build_source(cfg: dict):
     sys.exit(f"Unknown source type: {t}")
 
 
+def build_maintenance(cfg: dict, source, discord: "Discord", server_name: str):
+    """Unattended updates + nightly backups (maintenance.py). None when not configured."""
+    m = cfg.get("maintenance") or {}
+    if not m.get("enabled"):
+        return None
+    key = os.environ.get("LOWMS_API_KEY") or m.get("api_key")
+    if not key or key.startswith("YOUR"):
+        log.warning("maintenance.enabled but no LOW.MS API key (LOWMS_API_KEY or maintenance.api_key); disabled")
+        return None
+    server_id = m.get("server_id") or (cfg.get("source") or {}).get("server_id")
+    if not server_id:
+        log.warning("maintenance needs source.server_id (or maintenance.server_id); disabled")
+        return None
+    import maintenance
+    base = m.get("base_url", maintenance.API_BASE)
+    panel = None
+    tc = getattr(source, "token_cache", None)
+    if tc is None and getattr(source, "token", None):
+        tok = source.token
+        tc = type("StaticToken", (), {"get": lambda self: tok, "invalidate": lambda self: None})()
+    if tc is not None:
+        panel = maintenance.PanelAPI(tc, server_id, base)
+    elif (m.get("update") or {}).get("enabled", True):
+        log.warning("maintenance: game updates need the nexus panel login (source.login); updates disabled")
+
+    def notify(kind: str, detail: str):
+        log.info("MAINTENANCE %s: %s", kind, detail)
+        if m.get("notify", True) and discord.url:
+            try:
+                discord.post(Event(kind, None, {"detail": detail}), server_name, {kind})
+            except Exception as e:
+                log.warning("Discord post failed: %s", e)
+
+    return maintenance.Maintenance(m, maintenance.PublicAPI(key, server_id, base), panel, notify)
+
+
 def record_event(store, ev: "Event") -> None:
     """Write one parsed event into the stats database."""
     ts = ev.extra.get("ts")
@@ -813,6 +855,8 @@ def main():
     ap.add_argument("--backfill", metavar="FILE", help="Load a whole log file into the stats database (no Discord posts), then exit")
     ap.add_argument("--render-site", action="store_true", help="Render the stats web page from the database once and exit")
     ap.add_argument("--refresh-steam", action="store_true", help="Fetch Steam achievements for known players once, then exit")
+    ap.add_argument("--maintenance-check", action="store_true",
+                    help="Read-only: verify the LOW.MS API key, list backups, show update status, then exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -900,6 +944,13 @@ def main():
         return
 
     source = build_source(cfg)
+    if args.maintenance_check:
+        mnt = build_maintenance(cfg, source, discord, server_name)
+        if not mnt:
+            sys.exit("Maintenance is not enabled/configured (see the maintenance block in config.example.json)")
+        for line in mnt.report():
+            print(line)
+        return
     if args.discover:
         if not isinstance(source, FTPSource):
             sys.exit("--discover only works with the ftp source type")
@@ -965,6 +1016,13 @@ def main():
         except Exception as e:
             log.warning("Steam refresh failed: %s", e)
 
+    maint = build_maintenance(cfg, source, discord, server_name)
+    if maint:
+        log.info("Maintenance on: checks every %.0f min when empty; backup window %s %s; updates %s%s",
+                 maint.interval / 60, (cfg.get("maintenance") or {}).get("backup", {}).get("window", "02:00-06:00"),
+                 (cfg.get("maintenance") or {}).get("timezone", "America/Los_Angeles"),
+                 "on" if maint.update_enabled else "off", " (DRY RUN)" if maint.dry_run else "")
+
     # If a shutdown isn't followed by a boot within this window, treat it as offline
     # (vs a quick restart that comes back) and post the offline message once.
     offline_grace = float(cfg.get("offline_grace_seconds", 300))
@@ -989,7 +1047,10 @@ def main():
                             changed = True
                         except Exception as e:
                             log.warning("DB write failed for %s: %s", ev.kind, e)
-                    discord.post(ev, server_name, events)
+                    if maint:
+                        maint.observe(ev, len(parser.s.online))
+                    if not (maint and maint.suppressing(ev.kind)):
+                        discord.post(ev, server_name, events)
                     # Track down/up so we can tell a lingering outage from a quick restart.
                     if ev.kind == "server_restart":
                         down_since, offline_posted = time.time(), False
@@ -997,7 +1058,10 @@ def main():
                         down_since = None
             backoff = interval
             now = time.time()
-            if down_since and not offline_posted and now - down_since > offline_grace:
+            # Our own maintenance can legitimately keep it down past the grace period: hold
+            # the alert (don't drop it) until the maintenance quiet period is over.
+            if (down_since and not offline_posted and now - down_since > offline_grace
+                    and not (maint and maint.suppressing("server_offline"))):
                 discord.post(Event("server_offline", None, {}), server_name, events)
                 offline_posted = True
                 down_since = None
@@ -1007,6 +1071,11 @@ def main():
             if steam_enabled and now - last_steam >= steam_interval:
                 refresh_steam()
                 last_steam = now
+            if maint:
+                try:
+                    maint.tick()
+                except Exception as e:
+                    log.warning("Maintenance check failed: %s", e)
         except KeyboardInterrupt:
             log.info("Stopping")
             if store:

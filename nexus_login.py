@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -70,6 +71,9 @@ class TokenCache:
         self.profile_dir = STATE_DIR / "browser-profile"
         self._token: Optional[str] = None
         self._exp: Optional[float] = None
+        # The log poller and the maintenance thread share this cache; the lock stops them
+        # both launching a browser sign-in when the token expires at the same moment.
+        self._lock = threading.RLock()
         self._load()
 
     # -- cache -------------------------------------------------------------
@@ -88,17 +92,19 @@ class TokenCache:
             pass
 
     def invalidate(self):
-        self._token = self._exp = None
-        self._save()
+        with self._lock:
+            self._token = self._exp = None
+            self._save()
 
     def get(self) -> str:
-        if self._token and (self._exp is None or self._exp - 60 > time.time()):
+        with self._lock:
+            if self._token and (self._exp is None or self._exp - 60 > time.time()):
+                return self._token
+            log.info("Nexus token missing or expiring; signing in to the panel")
+            self._token = self.login()
+            self._exp = jwt_exp(self._token)
+            self._save()
             return self._token
-        log.info("Nexus token missing or expiring; signing in to the panel")
-        self._token = self.login()
-        self._exp = jwt_exp(self._token)
-        self._save()
-        return self._token
 
     # -- browser -----------------------------------------------------------
     def login(self) -> str:
