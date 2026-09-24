@@ -137,6 +137,23 @@ class Store:
         self.conn.execute("INSERT INTO meta(key, value) VALUES (?, ?) "
                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
 
+    def set_meta(self, key: str, value) -> None:
+        self._set_meta(key, value)
+        self.conn.commit()
+
+    def record_clock_offset(self, log_ts: int, real_now: Optional[float] = None) -> None:
+        """Remember how far the game server's log clock is from real time.
+
+        Log lines carry the SERVER's wall clock, which we store as if it were UTC, so
+        comparing those timestamps against time.time() overstates every "x ago" by the
+        server's UTC offset. We see both clocks here (a line is read seconds after it is
+        written), so record the difference, rounded to a quarter hour to drop polling
+        jitter, and let the page subtract it.
+        """
+        off = int(round(((real_now or time.time()) - log_ts) / 900.0) * 900)
+        if str(off) != str(self.get_meta("log_clock_offset")):
+            self.set_meta("log_clock_offset", off)
+
     def get_meta(self, key: str, default=None):
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else default

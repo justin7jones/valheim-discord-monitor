@@ -1113,6 +1113,11 @@ def main():
                         down_since = None
             backoff = interval
             now = time.time()
+            if store and changed and parser.last_ts is not None:
+                try:
+                    store.record_clock_offset(parser.last_ts, now)
+                except Exception as e:
+                    log.debug("clock offset not recorded: %s", e)
             # Our own maintenance can legitimately keep it down past the grace period: hold
             # the alert (don't drop it) until the maintenance quiet period is over.
             if (down_since and not offline_posted and now - down_since > offline_grace

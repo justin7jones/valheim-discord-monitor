@@ -145,7 +145,8 @@ def render_html(db_path: str, cfg: dict) -> str:
     server_name = cfg.get("server_name", "Valheim Server")
     tz_label = (cfg.get("stats_site") or {}).get("timezone_label", "server time")
     top_n = int((cfg.get("stats_site") or {}).get("top_n", 10))
-    now = int(time.time())
+    now_real = int(time.time())          # true epoch — for Steam data, which uses real epochs
+    now = now_real                       # game-server clock — for everything parsed from the log
 
     conn = stats_db.connect(db_path)
     try:
@@ -159,8 +160,16 @@ def render_html(db_path: str, cfg: dict) -> str:
         ach = stats_db.achievements_leaderboard(conn, top_n)
         unlocks = stats_db.recent_unlocks(conn, 12)
         last_event = conn.execute("SELECT value FROM meta WHERE key='last_event_at'").fetchone()
+        off_row = conn.execute("SELECT value FROM meta WHERE key='log_clock_offset'").fetchone()
     finally:
         conn.close()
+    # Log timestamps are the SERVER's wall clock stored as if UTC. Shift "now" onto that
+    # same clock so "x ago" is right and the Updated line reads in server time.
+    try:
+        clock_offset = int(off_row["value"]) if off_row and off_row["value"] else 0
+    except (TypeError, ValueError):
+        clock_offset = 0
+    now = now_real - clock_offset
     last_event_at = int(last_event["value"]) if last_event and last_event["value"] else None
 
     max_play = max((r["total_seconds"] or 0 for r in lb), default=0) or 1
@@ -266,7 +275,7 @@ def render_html(db_path: str, cfg: dict) -> str:
             last = ""
             if r.get("last_unlock_name"):
                 last = (f'<div class="ach-last">Latest: <b>{esc(r["last_unlock_name"])}</b> '
-                        f'· {esc(fmt_date(r.get("last_unlock_at")))}</div>')
+                        f'· {esc(fmt_date((r.get("last_unlock_at") or 0) - clock_offset or None))}</div>')
             body = (f'<div class="ach-count"><b>{unlocked}</b> / {total} '
                     f'<span class="ach-pct">{pct}%</span></div>'
                     f'<div class="ach-bar"><span style="width:{pct}%"></span></div>{last}')
@@ -287,7 +296,7 @@ def render_html(db_path: str, cfg: dict) -> str:
                             if u.get("icon") else "")
                  + f'<span class="ach-uname">{esc(u["name"])}</span>'
                    f'<span class="ach-uwho">{esc(u.get("persona") or "")}</span>'
-                   f'<span class="ach-uwhen">{esc(fmt_ago(u["unlocktime"], now))}</span></li>')
+                   f'<span class="ach-uwhen">{esc(fmt_ago(u["unlocktime"], now_real))}</span></li>')
                 for u in unlocks)
             ach_html += (f'<section class="board recent"><div class="board-head"><h2>Recent Unlocks</h2>'
                          f'<p>Latest achievements earned</p></div><ul class="unlock-feed">{items}</ul></section>')
