@@ -574,6 +574,54 @@ class NexusConsoleSource:
         return raw.splitlines()
 
 
+class LowmsConsoleSource:
+    """
+    LOW.MS **public** API console endpoint:
+        GET https://api.prod.nexus.low.ms/v1/servers/<id>/console?lines=N
+        Authorization: Bearer lowms_...
+    Returns {"lines": [...]} oldest first (max 500). Needs an API key with the
+    `console:read` scope (Panel -> Account -> API Keys), which can be pinned to
+    this one server.
+
+    Preferred over the `nexus` source: same log lines, but a documented endpoint
+    with a stable key, so there is no headless-browser sign-in to break when the
+    panel's login page changes or the account gets an MFA/CAPTCHA challenge.
+    Line-window source.
+    """
+
+    def __init__(self, server_id: str, api_key: str, lines: int = 300,
+                 base_url: str = "https://api.prod.nexus.low.ms"):
+        self.url = f"{base_url.rstrip('/')}/v1/servers/{server_id}/console?lines={min(max(int(lines), 1), 500)}"
+        self.key = api_key
+
+    def fetch_lines(self) -> list[str]:
+        req = urllib.request.Request(self.url, headers={"Authorization": f"Bearer {self.key}",
+                                                        "Accept": "application/json",
+                                                        "User-Agent": "valheim-discord-monitor/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            code = ""
+            try:
+                code = (json.loads(raw).get("error") or {}).get("code", "")
+            except Exception:
+                pass
+            hint = {"missing_scope": " (the key needs the console:read scope)",
+                    "not_found": " (wrong server id, or the key is pinned to another server)",
+                    "invalid_key": " (bad or revoked LOWMS_API_KEY)",
+                    "rate_limited": " (slow down: 60 reads/min per key)"}.get(code, "")
+            raise RuntimeError(f"LOW.MS console {e.code} {code}{hint}") from None
+        lines = data.get("lines") if isinstance(data, dict) else data
+        if isinstance(lines, str):
+            return lines.splitlines()
+        if isinstance(lines, list):
+            return [x if isinstance(x, str) else str(x) for x in lines]
+        raise ValueError(f"Unrecognised console JSON shape: {type(lines).__name__}")
+
+
+
 class A2SSource:
     """
     Steam server query (A2S_INFO) — works for any Valheim dedicated server, crossplay or not,
@@ -761,6 +809,13 @@ def build_source(cfg: dict):
             token = None
         return NexusConsoleSource(src["server_id"], token, int(src.get("lines", 300)),
                                   src.get("base_url", "https://api.prod.nexus.low.ms"), token_cache=cache)
+    if t == "lowms":
+        key = os.environ.get("LOWMS_API_KEY") or src.get("api_key") or (cfg.get("maintenance") or {}).get("api_key")
+        if not key or key.startswith("YOUR"):
+            sys.exit("The lowms source needs an API key: set LOWMS_API_KEY or source.api_key "
+                     "(Panel -> Account -> API Keys, scope console:read)")
+        return LowmsConsoleSource(src["server_id"], key, int(src.get("lines", 300)),
+                                  src.get("base_url", "https://api.prod.nexus.low.ms"))
     if t == "a2s":
         return A2SSource(src["host"], int(src.get("port", 2457)), float(src.get("timeout", 3.0)),
                          int(src.get("offline_after", 3)))

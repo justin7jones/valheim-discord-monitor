@@ -71,6 +71,12 @@
     "offline_after": 3
   },
   "_alternative_sources": {
+    "lowms": {
+      "type": "lowms",
+      "server_id": "YOUR-SERVER-UUID",
+      "api_key": "YOUR-lowms_-KEY-OR-USE-LOWMS_API_KEY-ENV",
+      "lines": 300
+    },
     "steamapi": {
       "type": "steamapi",
       "host": "YOUR.SERVER.IP",

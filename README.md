@@ -6,11 +6,11 @@ on the game server, so Steam achievements keep working. Two modes:
 | Mode | Needs | Events |
 |---|---|---|
 | **Count mode** (`a2s` or `steamapi`) | Only the server's IP — polls the Steam query port (game port + 1), or Steam's master server via the Web API when that port is firewalled | player joined / left (count only), server online / offline |
-| **Log mode** (`nexus`, `ftp`, `sftp`, `file`, `http`) | Read access to `valheim_console.log` — on LOW.MS via the panel login (`nexus`) | named **login**, **logout**, **death**, respawn |
+| **Log mode** (`lowms`, `nexus`, `ftp`, `sftp`, `file`, `http`) | Read access to `valheim_console.log` — on LOW.MS via the public API (`lowms`) | named **login**, **logout**, **death**, respawn |
 
-Log mode is the one you want: names and deaths. On LOW.MS use the `nexus`
-source (no FTP/SFTP or console API exists there, but the monitor can sign in to
-the panel as you). Count mode is the fallback for hosts where nothing else
+Log mode is the one you want: names and deaths. On LOW.MS use the `lowms`
+source: the public API now serves the console with a plain API key (no FTP/SFTP
+exists there, and the older `nexus` source had to sign in to the panel as you). Count mode is the fallback for hosts where nothing else
 works — note the Steam-based sources report a stale count on crossplay
 servers, because relayed players never register with Steam.
 
@@ -115,7 +115,26 @@ Set `"tls": true` if the host requires FTPS.
 LOW.MS's Nexus panel does not currently offer FTP/SFTP (confirmed with their
 support, Sept 2026) — use count mode there.
 
-#### `nexus` (LOW.MS panel — recommended on LOW.MS)
+#### `lowms` (LOW.MS public API — recommended on LOW.MS)
+The documented [LOW.MS public API](https://api.prod.nexus.low.ms/v1/docs) reads the
+console directly:
+
+```json
+"source": { "type": "lowms", "server_id": "YOUR-SERVER-UUID", "lines": 300 },
+"events": ["login", "logout", "death", "server_restart", "server_online", "server_offline"]
+```
+
+Create a key under Panel → Account → **API Keys** with the `console:read` scope
+(pin it to this server), and put it in `LOWMS_API_KEY` or `source.api_key`. Same log
+lines as the `nexus` source below — up to 500 per call instead of 300 — but a stable,
+documented endpoint with no browser sign-in, so it can't break when the panel's login
+page changes or the account gets an MFA or CAPTCHA challenge. **Prefer this.**
+
+The one thing it can't do is install game updates (the public API has no update
+endpoint), so the `maintenance` block's update half needs the `nexus` login;
+backups work fine with the key alone.
+
+#### `nexus` (LOW.MS panel — legacy; use `lowms` instead)
 The panel's Console tab reads the live log from
 `GET https://api.prod.nexus.low.ms/user/servers/<id>/daemon/console?lines=N`
 using the panel's own Auth0 session token (the public `lowms_…` API keys are
