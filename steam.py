@@ -57,6 +57,31 @@ def _get(path: str, params: dict, timeout: float = 20.0):
         return json.loads(r.read().decode("utf-8", errors="replace"))
 
 
+class KeyRejected(Exception):
+    """The Steam Web API key itself was refused (revoked, rotated, or wrong)."""
+
+
+def _is_auth_error(e) -> bool:
+    return isinstance(e, urllib.error.HTTPError) and e.code in (401, 403)
+
+
+def check_key(key: str) -> None:
+    """Cheap pre-flight so a bad key can't be mistaken for everyone going private.
+
+    GetPlayerAchievements answers 403 both for a private profile AND for a bad key, so
+    without this every player would be written to the database as "private" the moment
+    the key is rotated. Uses a global (non-player) endpoint, which only fails on the key.
+    """
+    try:
+        _get("/ISteamUserStats/GetSchemaForGame/v2/", {"key": key, "appid": APP_ID, "l": "english"})
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise KeyRejected(f"Steam rejected the API key (HTTP {e.code}). It was probably rotated or "
+                              f"revoked - update STEAM_API_KEY or steam.api_key") from None
+    except Exception:
+        pass  # network blips are not the key's fault; let the normal calls retry
+
+
 def fetch_schema(key: str) -> list:
     d = _get("/ISteamUserStats/GetSchemaForGame/v2/", {"key": key, "appid": APP_ID, "l": "english"})
     ach = (((d or {}).get("game") or {}).get("availableGameStats") or {}).get("achievements") or []
@@ -109,6 +134,13 @@ def update_all(store, key: str, limit: int = 25, schema_ttl: int = SCHEMA_TTL) -
     if not steam_ids:
         return 0
 
+    # Verify the key BEFORE touching any player rows (see check_key).
+    try:
+        check_key(key)
+    except KeyRejected as e:
+        log.error("Steam refresh aborted: %s", e)
+        return 0
+
     # Achievement catalogue — at most once per schema_ttl.
     last = store.get_meta("steam_schema_at")
     if last is None or time.time() - int(last) > schema_ttl:
@@ -137,10 +169,12 @@ def update_all(store, key: str, limit: int = 25, schema_ttl: int = SCHEMA_TTL) -
             a, last_at = max(unlocks, key=lambda x: x[1])
             last_name = name_by_api.get(a, a)
             store.save_unlocks(sid, unlocks)
-        store.save_profile(
-            sid, persona=prof.get("persona"), avatar=prof.get("avatar"),
-            profile_url=prof.get("profile_url"), visibility=prof.get("visibility"),
-            unlocked=unlocked, total=total, last_unlock_at=last_at, last_unlock_name=last_name, error=err)
+        fields = dict(unlocked=unlocked, total=total, last_unlock_at=last_at,
+                      last_unlock_name=last_name, error=err)
+        if prof:  # a failed summaries call must not blank out a persona/avatar we already have
+            fields.update(persona=prof.get("persona"), avatar=prof.get("avatar"),
+                          profile_url=prof.get("profile_url"), visibility=prof.get("visibility"))
+        store.save_profile(sid, **fields)
         updated += 1
         time.sleep(0.4)  # be gentle with the API
     log.info("Steam: refreshed %d profile(s)", updated)

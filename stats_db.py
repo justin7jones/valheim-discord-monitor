@@ -250,9 +250,15 @@ class Store:
         self.conn.commit()
 
     def save_profile(self, steam_id: str, **f) -> None:
-        cols = ("persona", "avatar", "profile_url", "visibility", "unlocked", "total",
-                "last_unlock_at", "last_unlock_name", "error")
-        vals = [f.get(c) for c in cols]
+        """Upsert a Steam profile. Only the fields PASSED IN are written, so a partial
+        refresh (e.g. the summaries call failed) can't blank out a persona or avatar
+        that is already stored. Pass an explicit None to clear a field."""
+        known = ("persona", "avatar", "profile_url", "visibility", "unlocked", "total",
+                 "last_unlock_at", "last_unlock_name", "error")
+        cols = tuple(c for c in known if c in f)
+        if not cols:
+            return
+        vals = [f[c] for c in cols]
         self.conn.execute(
             f"INSERT INTO steam_profile(steam_id, {', '.join(cols)}, updated_at) "
             f"VALUES (?{', ?' * len(cols)}, ?) "
