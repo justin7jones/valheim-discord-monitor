@@ -60,6 +60,31 @@ def jwt_exp(token: str) -> Optional[float]:
         return None
 
 
+PLACEHOLDER_HINTS = ("your@email", "you@example.com", "yourpassword", "your-panel-password",
+                     "changeme", "paste", "example.com")
+
+
+def check_credentials(email, password):
+    """Fail loudly on placeholder credentials.
+
+    A placeholder email is rejected by Auth0 as malformed, so the sign-in never reaches
+    a password field and the monitor just retries forever with a confusing
+    "no password field found" error. Catch it here and say what to fix instead.
+    """
+    e, pw = (email or "").strip(), (password or "").strip()
+    if not e or not pw:
+        raise RuntimeError("nexus login needs an email and password: set NEXUS_EMAIL / NEXUS_PASSWORD, "
+                           "or source.login in config.json (or switch to the 'lowms' source, which needs "
+                           "no panel login at all)")
+    low = e.lower()
+    if "@" not in low or "." not in low.split("@")[-1] or any(h in low for h in PLACEHOLDER_HINTS) \
+            or any(h in pw.lower() for h in PLACEHOLDER_HINTS):
+        raise RuntimeError(f"nexus login credentials are still placeholders (email={e!r}). Auth0 rejects "
+                           "that as an invalid address, so the sign-in never reaches the password step. "
+                           "Put your real panel login in NEXUS_EMAIL / NEXUS_PASSWORD or source.login, "
+                           "or switch to the 'lowms' source, which needs no panel login at all")
+
+
 class TokenCache:
     def __init__(self, server_id: str, email: str, password: str, selectors: Optional[dict] = None,
                  headless: bool = True, login_timeout: float = 90.0, cache_path: Optional[Path] = None):
@@ -108,6 +133,7 @@ class TokenCache:
 
     # -- browser -----------------------------------------------------------
     def login(self) -> str:
+        check_credentials(self.email, self.password)
         try:
             from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
         except ImportError:
@@ -136,7 +162,18 @@ class TokenCache:
                     try:
                         self._fill_login(page)
                     except Exception as e:  # keep going; maybe we were mid-redirect
-                        log.warning("Login form handling failed: %s", e)
+                        detail = ""
+                        try:  # Auth0 shows the reason on the page ("Email is not valid." etc.)
+                            for sel in ("[role=alert]", ".ulp-input-error-message", "#error-element-username",
+                                        "#error-element-password", ".error-cloud"):
+                                for el in page.query_selector_all(sel):
+                                    t = (el.inner_text() or "").strip()
+                                    if t and t not in detail:
+                                        detail += ("; " if detail else "") + t
+                        except Exception:
+                            pass
+                        log.warning("Login form handling failed: %s%s", e,
+                                    f"  [page says: {detail}]" if detail else "")
                 page.wait_for_timeout(500)
 
             if "value" not in captured:
