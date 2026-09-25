@@ -279,9 +279,18 @@ With a `maintenance` block, the monitor keeps the server patched and backed up
    any file Valheim has locked, so it stops first. When the backup allowance is full,
    the oldest *unpinned* backup is deleted and the backup retried
    (`delete_oldest_when_full`).
-3. **Update:** if the panel reports an update waiting, install it immediately. If a
-   backup is also due, the order is stop → backup → update → start, so every update
-   has a fresh backup taken just before it.
+3. **Update:** the panel is asked hourly (`update.check_interval_seconds`) whether an
+   update is waiting — that check runs **whether or not anyone is playing**, because it
+   only reads. When one is waiting it is remembered and installed **as soon as the server
+   is empty**, not at the next quarter-hour. If a backup is also due, the order is
+   stop → backup → update → start, so every update has a fresh backup taken just before it.
+
+A queued update waits for `update.empty_settle_seconds` (180) of *continuous* emptiness
+before installing, so a crossplay player who drops and reconnects doesn't get a server
+restart in the face; if someone rejoins during that window the timer restarts. A failed
+update backs off for `update.retry_cooldown_seconds` (1 hour) instead of retrying on
+every poll. When an update is found while people are playing, Discord says so once, and
+the install announces itself when it happens.
 
 The server is **always started again** afterwards, even when a step fails. Discord
 gets one "down for maintenance" line and one "finished" (or "had a problem") line;
@@ -291,11 +300,12 @@ back, the "offline" alert still fires once the quiet period ends.
 
 **Which API does what.** Backups, stop/start and job status use the documented
 [LOW.MS Public API](https://api.prod.nexus.low.ms/v1/docs) with a `lowms_` key.
-The public API has **no update endpoint**, so the update check (`update-info`) and
-install (`update_server`) use the same private panel endpoints as the panel's own
-**Update** button, through the monitor's signed-in panel session (the `nexus`
-source's `login`). If LOW.MS changes those, updates stop and log a warning while
-backups carry on.
+The public API has **no update endpoint** (re-checked Sept 2026), so the update check
+(`update-info`) and install (`update_server`) use the same private panel endpoints as
+the panel's own **Update** button. Those need a panel sign-in: either the `nexus`
+source's session, or `maintenance.panel_login` (or `NEXUS_EMAIL` / `NEXUS_PASSWORD`)
+when the log source doesn't have one — which is the case with the `lowms` source. If
+LOW.MS changes those endpoints, updates stop and log a warning while backups carry on.
 
 Setup:
 1. Panel → Account → **API Keys**: create a key with scopes `backups:read`,
@@ -358,7 +368,11 @@ or run it in a terminal.
 | `maintenance.backup.window` | 02:00-06:00 | Nightly backup window (once per night). |
 | `maintenance.backup.stop_server` | true | Stop the server for a consistent backup. |
 | `maintenance.backup.delete_oldest_when_full` | true | Delete the oldest unpinned backup when the allowance is full. |
-| `maintenance.update.enabled` | true | Install game updates as soon as one is waiting. |
+| `maintenance.update.enabled` | true | Install game updates as soon as the server is empty. |
+| `maintenance.update.check_interval_seconds` | 3600 | How often to ask whether an update is waiting (runs even with players online). |
+| `maintenance.update.empty_settle_seconds` | 180 | Continuous emptiness required before installing. |
+| `maintenance.update.retry_cooldown_seconds` | 3600 | Wait this long after a failed update before retrying. |
+| `maintenance.panel_login` | — | Panel email/password for updates when the source has no session (e.g. `lowms`); or `NEXUS_EMAIL` / `NEXUS_PASSWORD`. |
 | `maintenance.dry_run` | false | Log the plan without doing anything. |
 | `discord.embeds` | true | Coloured embed vs plain text. |
 | `discord.show_player_count` | true | Footer with the current online count. |

@@ -280,11 +280,11 @@ class Discord:
     COLORS = {"login": 0x57F287, "logout": 0x95A5A6, "death": 0xED4245, "respawn": 0xFEE75C, "server_up": 0x5865F2,
               "player_joined": 0x57F287, "player_left": 0x95A5A6, "server_online": 0x57F287, "server_offline": 0xED4245,
               "server_restart": 0xE0A13C, "maintenance_start": 0x5865F2, "maintenance_done": 0x57F287,
-              "maintenance_failed": 0xED4245}
+              "maintenance_failed": 0xED4245, "maintenance_pending": 0xE0A13C}
     EMOJI = {"login": "🟢", "logout": "🔴", "death": "💀", "respawn": "🔥", "server_up": "🛡️",
              "player_joined": "🟢", "player_left": "🔴", "server_online": "🟢", "server_offline": "🔴",
              "server_restart": "🔻", "maintenance_start": "🛠️", "maintenance_done": "✅",
-             "maintenance_failed": "⚠️"}
+             "maintenance_failed": "⚠️", "maintenance_pending": "🕑"}
     DEFAULT_MESSAGES = {
         "login": "**{player}** has arrived in {server}.",
         "logout": "**{player}** has left {server}.",
@@ -298,6 +298,7 @@ class Discord:
         "player_joined": "{who} arrived in {server}. **{count}/{max}** online.",
         "player_left": "{who} left {server}. **{count}/{max}** online.",
         # Unattended maintenance (maintenance.py) — only runs while nobody is online.
+        "maintenance_pending": "On **{server}**, {detail}.",
         "maintenance_start": "**{server}** is down for maintenance: {detail}.",
         "maintenance_done": "**{server}** maintenance finished: {detail}.",
         "maintenance_failed": "**{server}** maintenance had a problem: {detail}",
@@ -841,14 +842,31 @@ def build_maintenance(cfg: dict, source, discord: "Discord", server_name: str):
     import maintenance
     base = m.get("base_url", maintenance.API_BASE)
     panel = None
+    # Installing a game update is the one thing the public API cannot do, so it needs a
+    # panel session. Reuse the log source's if it has one (the nexus source); otherwise
+    # sign in on our own, so updates also work with the `lowms` source.
     tc = getattr(source, "token_cache", None)
     if tc is None and getattr(source, "token", None):
         tok = source.token
         tc = type("StaticToken", (), {"get": lambda self: tok, "invalidate": lambda self: None})()
+    if tc is None and (m.get("update") or {}).get("enabled", True):
+        login = dict(m.get("panel_login") or (cfg.get("source") or {}).get("login") or {})
+        email = os.environ.get("NEXUS_EMAIL", login.get("email"))
+        password = os.environ.get("NEXUS_PASSWORD", login.get("password"))
+        if email and password:
+            try:
+                from nexus_login import TokenCache, check_credentials
+                check_credentials(email, password)
+                tc = TokenCache(server_id, email, password, selectors=login.get("selectors"),
+                                headless=not login.get("headed", False),
+                                login_timeout=float(login.get("timeout", 90)))
+            except Exception as e:  # noqa: BLE001
+                log.warning("maintenance: panel sign-in unavailable (%s); updates disabled", e)
+        else:
+            log.warning("maintenance: game updates need a panel login "
+                        "(maintenance.panel_login, or NEXUS_EMAIL / NEXUS_PASSWORD); updates disabled")
     if tc is not None:
         panel = maintenance.PanelAPI(tc, server_id, base)
-    elif (m.get("update") or {}).get("enabled", True):
-        log.warning("maintenance: game updates need the nexus panel login (source.login); updates disabled")
 
     def notify(kind: str, detail: str):
         log.info("MAINTENANCE %s: %s", kind, detail)

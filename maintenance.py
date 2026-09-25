@@ -230,6 +230,16 @@ class Maintenance:
         self.prune = bool(b.get("delete_oldest_when_full", True))
         u = cfg.get("update") or {}
         self.update_enabled = bool(u.get("enabled", True)) and panel is not None
+        # The check is hourly and runs regardless of who is online; the INSTALL waits for
+        # an empty server. `settle` guards against acting on a momentary gap -- crossplay
+        # players drop and reconnect, and we don't want to restart under someone's feet.
+        self.update_interval = float(u.get("check_interval_seconds", 3600))
+        self.settle = float(u.get("empty_settle_seconds", cfg.get("empty_settle_seconds", 180)))
+        self.retry_cooldown = float(u.get("retry_cooldown_seconds", 3600))
+        self.last_update_check = 0.0
+        self.pending_update: Optional[dict] = None
+        self.update_retry_after = 0.0
+        self.empty_since: Optional[float] = None
         self.presence = Presence(float(cfg.get("count_max_age_seconds", 780)), clock)
         self.state_path = Path(state_path or cfg.get("state_file", "maintenance_state.json"))
         self.state = self._load()
@@ -293,31 +303,67 @@ class Maintenance:
     def busy(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
+    def check_for_update(self) -> Optional[dict]:
+        """Ask the panel whether an update is waiting. Safe to call while players are on:
+        it is a read-only call, and nothing is installed until the server is empty."""
+        if not self.update_enabled:
+            return None
+        try:
+            info = self.panel.update_info()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Update check failed: %s", e)
+            return self.pending_update
+        state = info.get("updateState")
+        installed = info.get("installedVersion") or info.get("installedBuildId")
+        if state == "available":
+            if not self.pending_update:
+                ver = info.get("latestVersion") or info.get("latestBuildId") or "a new build"
+                log.info("Update available (%s); will install once the server is empty", ver)
+                # Only announce the wait if it actually has to wait -- when the server is
+                # already empty the install starts moments later and says so itself.
+                if not self.presence.empty()[0]:
+                    self.notify("maintenance_pending", f"a game update ({ver}) is waiting — it will install "
+                                                       f"as soon as nobody is playing")
+            self.pending_update = info
+        else:
+            if self.pending_update:
+                log.info("Update no longer pending (state %s, installed %s)", state, installed)
+            self.pending_update = None
+            log.debug("Update check: state %s (installed %s)", state, installed)
+        return self.pending_update
+
     def tick(self) -> Optional[str]:
-        """Called every loop. Returns a short reason string (for logs/tests)."""
+        """Called every loop (~every poll). Cheap: the only API call is the hourly
+        update check. Returns a short reason string (for logs/tests)."""
         now = self.clock()
         if self.busy():
             return "running"
-        if now - self.last_check < self.interval:
-            return None
-        self.last_check = now
+
+        # 1. Hourly update check — runs whether or not anyone is playing.
+        if self.update_enabled and now - self.last_update_check >= self.update_interval:
+            self.last_update_check = now
+            self.check_for_update()
+
+        # 2. Is the server empty, and has it been empty long enough to act?
         ok, why = self.presence.empty()
         if not ok:
-            log.info("Maintenance check: skipped (%s)", why)
+            self.empty_since = None
+            if now - self.last_check >= self.interval:
+                self.last_check = now
+                log.info("Maintenance: waiting (%s)%s", why,
+                         "; an update is queued" if self.pending_update else "")
             return f"skip: {why}"
+        if self.empty_since is None:
+            self.empty_since = now
+        settled = now - self.empty_since >= self.settle
+        self.last_check = now
+
         do_backup = self.backup_due()
-        update = None
-        if self.update_enabled:
-            try:
-                info = self.panel.update_info()
-                if info.get("updateState") == "available":
-                    update = info
-                log.info("Maintenance check: update state %s (installed %s)", info.get("updateState"),
-                         info.get("installedVersion") or info.get("installedBuildId"))
-            except Exception as e:
-                log.warning("Update check failed: %s", e)
+        update = self.pending_update if (settled and now >= self.update_retry_after) else None
+        if do_backup and not settled:
+            do_backup = False
         if not do_backup and not update:
-            return "idle"
+            return "idle" if settled else "settling"
         plan = (["backup"] if do_backup else []) + (["update"] if update else [])
         if self.dry_run:
             log.info("DRY RUN: would run %s now", " + ".join(plan))
@@ -433,10 +479,14 @@ class Maintenance:
                     self._save()
                     ver = info.get("installedVersion") or info.get("installedBuildId")
                     parts.append("updated" + (f" to {ver}" if ver else ""))
+                    self.pending_update = None
+                    self.last_update_check = 0.0   # re-check soon to confirm it took
                     stopped = True  # make sure it is running afterwards, whatever update_server did
                 except Exception as e:
                     log.warning("Update failed: %s", e)
                     problems.append(f"update failed: {e}")
+                    # Back off instead of retrying the moment the loop comes round again.
+                    self.update_retry_after = self.clock() + self.retry_cooldown
                     stopped = True
         finally:
             if stopped:

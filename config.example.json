@@ -54,13 +54,20 @@
     "notify": true,
     "state_file": "maintenance_state.json",
     "update": {
-      "enabled": true
+      "enabled": true,
+      "check_interval_seconds": 3600,
+      "empty_settle_seconds": 180,
+      "retry_cooldown_seconds": 3600
     },
     "backup": {
       "enabled": true,
       "window": "02:00-06:00",
       "stop_server": true,
       "delete_oldest_when_full": true
+    },
+    "panel_login": {
+      "email": "you@example.com  (or NEXUS_EMAIL env)",
+      "password": "your-panel-password  (or NEXUS_PASSWORD env)"
     }
   },
   "source": {
