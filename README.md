@@ -73,6 +73,7 @@ Vanilla Valheim already prints everything needed to `valheim_console.log`
 | Death   | `Got character ZDOID from Bjorn : 0:0` |
 | Respawn | next non-zero ZDOID for that name |
 | Logout  | `Destroying abandoned non persistent zdo … owner 1234567890` (owner id matches the player), or `Closing socket …` on direct-Steam servers, or `Player disconnected … now 0 player(s)` |
+| Boot    | `Game server connected` — written **several times** per start (up to 7 over ~2 min as the server re-announces its backend connection), so repeats within 5 minutes count as the same session |
 
 The monitor tails the log (by byte offset, so restarts never re-post), runs the
 lines through a small state machine, and posts an embed to a Discord webhook.

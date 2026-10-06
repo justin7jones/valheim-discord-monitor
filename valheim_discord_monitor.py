@@ -105,6 +105,7 @@ class ParserState:
     id_to_steam: dict = field(default_factory=dict)  # connection id -> SteamID64 (crossplay handshake)
     server_count: Optional[int] = None               # authoritative count from the server's own log lines
     down: bool = False                               # True after a shutdown, until the next boot
+    ready_at: Optional[int] = None                   # log time of the last "Game server connected"
 
 
 class ValheimLogParser:
@@ -116,6 +117,10 @@ class ValheimLogParser:
     seen — so it stays correct even for players who were already online when the monitor
     started, and through crossplay reconnect churn.
     """
+
+    # A boot re-announces itself for a while; treat repeats inside this window (seconds
+    # of log time) as the same session rather than a new one.
+    BOOT_REANNOUNCE_WINDOW = 300
 
     def __init__(self):
         self.s = ParserState()
@@ -253,11 +258,21 @@ class ValheimLogParser:
             return
 
         if RE_READY.search(line):
-            # A new server session is starting.
+            # Valheim writes "Game server connected" SEVERAL times while coming up (it
+            # re-announces its backend connection -- seen 7 times across ~2 minutes on one
+            # boot). Only the first is a new session: the repeats must not re-announce, and
+            # above all must not reset the parser state, or a player who reconnects during
+            # that window has their session closed and their SteamID link thrown away.
+            ts = self.last_ts if self.last_ts is not None else int(time.time())
+            if (not self.s.down and self.s.ready_at is not None
+                    and 0 <= ts - self.s.ready_at <= self.BOOT_REANNOUNCE_WINDOW):
+                self.s.ready_at = ts          # same boot, still settling
+                return
             had_players = bool(self.s.online)
             was_down = self.s.down
             yield from self._flush()          # close anyone still tracked (stale, not posted)
             self.s = ParserState()
+            self.s.ready_at = ts
             # If players were still online and we never saw the shutdown, note the restart
             # now; then always announce the server is back up.
             if had_players and not was_down:
