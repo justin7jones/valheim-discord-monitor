@@ -53,6 +53,24 @@ JOB_TIMEOUT = {"stop": 600, "start": 300, "restart": 300, "backup": 3600, "updat
 SUPPRESSED_KINDS = {"server_restart", "server_online", "server_offline"}
 
 
+# How the panel installs an update. Verified 2026-10-06 from the live panel: its
+# "Run a task now" control posts to /user/servers/{id}/tasks/{name}/run with the task
+# names restart | update | backup | mod-update, and the Overview Update button runs the
+# same "update" task. The older /servers/{id}/actions/update_server route that the JS
+# bundle still ships began answering 404 in Oct 2026, so it is kept only as a fallback.
+# Each entry is (path template, request body); all name an update explicitly, so the
+# only thing any of them can start is a game update.
+UPDATE_ROUTES = (
+    ("/user/servers/{sid}/tasks/update/run", {}),
+    ("/user/servers/{sid}/actions/update_server", {"stopFirst": True}),
+    ("/servers/{sid}/actions/update_server", {"stopFirst": True}),
+)
+
+
+class RouteGone(Exception):
+    """No known panel route accepted the update request (LOW.MS changed their API)."""
+
+
 class ApiError(Exception):
     def __init__(self, status: int, code: str = "", message: str = ""):
         super().__init__(f"HTTP {status} {code}: {message}".strip())
@@ -140,8 +158,9 @@ class PanelAPI:
     """The panel's own (undocumented) endpoints, using the monitor's signed-in session.
     Only the calls the public API lacks: update status, update install, backup delete."""
 
-    def __init__(self, token_cache, server_id: str, base: str = API_BASE):
+    def __init__(self, token_cache, server_id: str, base: str = API_BASE, update_route: Optional[str] = None):
         self.tc, self.sid, self.base = token_cache, server_id, base.rstrip("/")
+        self.update_route = update_route   # remembered across restarts via maintenance state
 
     def _req(self, method, path, body=None):
         try:
@@ -158,9 +177,32 @@ class PanelAPI:
         return self._req("GET", f"/user/servers/{self.sid}/update-info") or {}
 
     def update_server(self, stop_first: bool = True) -> Optional[dict]:
-        # Exactly what the panel's Update button sends.
-        return _unwrap_job(self._req("POST", f"/servers/{self.sid}/actions/update_server",
-                                     {"stopFirst": stop_first}))
+        """Ask the panel to install the waiting update (what its Update button does).
+
+        Tries the known routes and remembers the one that works, so a LOW.MS path change
+        costs one wasted 404 rather than a dead feature. Raises RouteGone if none is
+        accepted, which the caller treats as permanent instead of retrying hourly."""
+        tried = []
+        ordered = ([r for r in UPDATE_ROUTES if r[0] == self.update_route] +
+                   [r for r in UPDATE_ROUTES if r[0] != self.update_route])
+        for route, body in ordered:
+            path = route.format(sid=self.sid)
+            payload = dict(body)
+            if "stopFirst" in payload:
+                payload["stopFirst"] = stop_first
+            try:
+                resp = self._req("POST", path, payload)
+            except ApiError as e:
+                if e.status in (404, 405):      # route not on this API (any more)
+                    tried.append(f"{path} -> {e.status}")
+                    continue
+                raise
+            if route != self.update_route:
+                log.info("Panel update route: POST %s", path)
+            self.update_route = route
+            return _unwrap_job(resp)
+        raise RouteGone("the panel rejected every known update route — LOW.MS has probably "
+                        "changed its API again. Tried: " + "; ".join(tried))
 
     def jobs(self, limit: int = 20) -> list:
         return _as_list(self._req("GET", f"/user/servers/{self.sid}/jobs?limit={limit}"))
@@ -243,6 +285,8 @@ class Maintenance:
         self.presence = Presence(float(cfg.get("count_max_age_seconds", 780)), clock)
         self.state_path = Path(state_path or cfg.get("state_file", "maintenance_state.json"))
         self.state = self._load()
+        if panel is not None and self.state.get("update_route") and not panel.update_route:
+            panel.update_route = self.state["update_route"]
         self.last_check = 0.0
         self.thread: Optional[threading.Thread] = None
         self.active = False
@@ -470,6 +514,9 @@ class Maintenance:
             if update:
                 try:
                     job = self.panel.update_server(stop_first=True)
+                    if self.panel.update_route != self.state.get("update_route"):
+                        self.state["update_route"] = self.panel.update_route
+                        self._save()
                     if job:
                         self._wait(job, "update_server", getter=self._panel_job)
                     else:
@@ -482,6 +529,17 @@ class Maintenance:
                     self.pending_update = None
                     self.last_update_check = 0.0   # re-check soon to confirm it took
                     stopped = True  # make sure it is running afterwards, whatever update_server did
+                except RouteGone as e:
+                    # Permanent: retrying hourly would just repeat the same 404 forever.
+                    # Stop automating updates, say so once, and leave backups running.
+                    log.error("Update automation disabled: %s", e)
+                    self.update_enabled = False
+                    self.pending_update = None   # or the queued update retries every tick
+                    self.state["update_route_broken"] = True
+                    self._save()
+                    problems.append(f"update route rejected by the panel — automatic updates are now "
+                                    f"PAUSED (backups continue). Install this one from the LOW.MS panel. "
+                                    f"Details: {e}")
                 except Exception as e:
                     log.warning("Update failed: %s", e)
                     problems.append(f"update failed: {e}")
@@ -543,6 +601,12 @@ class Maintenance:
             try:
                 i = self.panel.update_info()
                 out.append(f"Update: state={i.get('updateState')} installed={i.get('installedVersion') or i.get('installedBuildId')}")
+                route = self.panel.update_route or self.state.get("update_route")
+                out.append("  install route: " + (route or
+                           f"not discovered yet (will try {len(UPDATE_ROUTES)} known spellings)"))
+                if self.state.get("update_route_broken"):
+                    out.append("  NOTE: a previous run found no working update route; "
+                               "restarting the monitor retries them all")
             except Exception as e:
                 out.append(f"Update check FAILED: {e}")
         else:

@@ -299,7 +299,7 @@ class Discord:
         "player_left": "{who} left {server}. **{count}/{max}** online.",
         # Unattended maintenance (maintenance.py) — only runs while nobody is online.
         "maintenance_pending": "On **{server}**, {detail}.",
-        "maintenance_start": "**{server}** is down for maintenance: {detail}.",
+        "maintenance_start": "**{server}** maintenance starting: {detail}.",
         "maintenance_done": "**{server}** maintenance finished: {detail}.",
         "maintenance_failed": "**{server}** maintenance had a problem: {detail}",
     }
@@ -867,6 +867,8 @@ def build_maintenance(cfg: dict, source, discord: "Discord", server_name: str):
                         "(maintenance.panel_login, or NEXUS_EMAIL / NEXUS_PASSWORD); updates disabled")
     if tc is not None:
         panel = maintenance.PanelAPI(tc, server_id, base)
+        # A previously discovered update route is restored from maintenance state by
+        # Maintenance.__init__, so a working route survives restarts.
 
     def notify(kind: str, detail: str):
         log.info("MAINTENANCE %s: %s", kind, detail)

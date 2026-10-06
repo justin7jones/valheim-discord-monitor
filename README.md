@@ -300,9 +300,15 @@ back, the "offline" alert still fires once the quiet period ends.
 
 **Which API does what.** Backups, stop/start and job status use the documented
 [LOW.MS Public API](https://api.prod.nexus.low.ms/v1/docs) with a `lowms_` key.
-The public API has **no update endpoint** (re-checked Sept 2026), so the update check
-(`update-info`) and install (`update_server`) use the same private panel endpoints as
-the panel's own **Update** button. Those need a panel sign-in: either the `nexus`
+The public API has **no update endpoint** (re-checked Oct 2026), so the update check
+(`update-info`) and the install use private panel endpoints. The install runs the
+panel's own `update` task — `POST /user/servers/{id}/tasks/update/run`, exactly what
+its **Update** button and its Settings → "Run a task now" control send. These are
+undocumented and do change: an older `/servers/{id}/actions/update_server` route began
+returning 404 in Oct 2026, so the monitor tries the known spellings, remembers the one
+that works, and if *none* is accepted it pauses update automation, says so once on
+Discord and keeps backups running (rather than failing hourly forever). Restarting the
+monitor retries them all. Those need a panel sign-in: either the `nexus`
 source's session, or `maintenance.panel_login` (or `NEXUS_EMAIL` / `NEXUS_PASSWORD`)
 when the log source doesn't have one — which is the case with the `lowms` source. If
 LOW.MS changes those endpoints, updates stop and log a warning while backups carry on.
