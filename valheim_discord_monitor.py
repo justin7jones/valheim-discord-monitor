@@ -295,11 +295,13 @@ class Discord:
     COLORS = {"login": 0x57F287, "logout": 0x95A5A6, "death": 0xED4245, "respawn": 0xFEE75C, "server_up": 0x5865F2,
               "player_joined": 0x57F287, "player_left": 0x95A5A6, "server_online": 0x57F287, "server_offline": 0xED4245,
               "server_restart": 0xE0A13C, "maintenance_start": 0x5865F2, "maintenance_done": 0x57F287,
-              "maintenance_failed": 0xED4245, "maintenance_pending": 0xE0A13C}
+              "maintenance_failed": 0xED4245, "maintenance_pending": 0xE0A13C,
+              "server_down": 0xED4245, "server_recovered": 0x57F287}
     EMOJI = {"login": "🟢", "logout": "🔴", "death": "💀", "respawn": "🔥", "server_up": "🛡️",
              "player_joined": "🟢", "player_left": "🔴", "server_online": "🟢", "server_offline": "🔴",
              "server_restart": "🔻", "maintenance_start": "🛠️", "maintenance_done": "✅",
-             "maintenance_failed": "⚠️", "maintenance_pending": "🕑"}
+             "maintenance_failed": "⚠️", "maintenance_pending": "🕑",
+             "server_down": "🚨", "server_recovered": "🟢"}
     DEFAULT_MESSAGES = {
         "login": "**{player}** has arrived in {server}.",
         "logout": "**{player}** has left {server}.",
@@ -313,6 +315,9 @@ class Discord:
         "player_joined": "{who} arrived in {server}. **{count}/{max}** online.",
         "player_left": "{who} left {server}. **{count}/{max}** online.",
         # Unattended maintenance (maintenance.py) — only runs while nobody is online.
+        # Outage alerts from health.py (LOW.MS status + log freshness).
+        "server_down": "**{server}** appears to be DOWN — {detail}. I'll post again when it returns.",
+        "server_recovered": "**{server}** is {detail}.",
         "maintenance_pending": "On **{server}**, {detail}.",
         "maintenance_start": "**{server}** maintenance starting: {detail}.",
         "maintenance_done": "**{server}** maintenance finished: {detail}.",
@@ -896,6 +901,51 @@ def build_maintenance(cfg: dict, source, discord: "Discord", server_name: str):
     return maintenance.Maintenance(m, maintenance.PublicAPI(key, server_id, base), panel, notify)
 
 
+def build_health(cfg: dict, maint, discord: "Discord", server_name: str, parser, store):
+    """Outside-in up/down monitoring (health.py). None when disabled."""
+    h = cfg.get("health") or {}
+    if not h.get("enabled", False):
+        return None
+    import health
+    api = getattr(maint, "pub", None) if maint else None
+    if api is None:
+        key = os.environ.get("LOWMS_API_KEY") or (cfg.get("maintenance") or {}).get("api_key") \
+            or (cfg.get("source") or {}).get("api_key")
+        server_id = (cfg.get("maintenance") or {}).get("server_id") or (cfg.get("source") or {}).get("server_id")
+        if key and server_id and not str(key).startswith("YOUR"):
+            import maintenance
+            api = maintenance.PublicAPI(key, server_id, h.get("base_url", maintenance.API_BASE))
+        else:
+            log.info("Health: no LOW.MS API key/server_id; using log freshness alone")
+
+    def log_age():
+        """Seconds since the newest log line. Log timestamps are the game server's wall
+        clock stored as if UTC, so subtract the offset the monitor records."""
+        if parser.last_ts is None:
+            return None
+        offset = 0
+        if store is not None:
+            try:
+                offset = int(store.get_meta("log_clock_offset") or 0)
+            except Exception:  # noqa: BLE001
+                offset = 0
+        return max(0.0, (time.time() - offset) - parser.last_ts)
+
+    def notify(kind: str, detail: str):
+        log.info("HEALTH %s: %s", kind, detail)
+        if h.get("notify", True) and discord.url:
+            try:
+                discord.post(Event(kind, None, {"detail": detail}), server_name, {kind})
+            except Exception as e:  # noqa: BLE001
+                log.warning("Discord post failed: %s", e)
+
+    # Our own backups/updates stop the server on purpose -- never alert for those.
+    suppress = (lambda: bool(maint and (maint.active or maint.suppressing("server_offline")))) if maint \
+        else (lambda: False)
+    return health.ServerHealth(h, api, log_age, notify, suppress,
+                               state_path=h.get("state_file", "health_state.json"))
+
+
 def record_event(store, ev: "Event") -> None:
     """Write one parsed event into the stats database."""
     ts = ev.extra.get("ts")
@@ -945,6 +995,8 @@ def main():
     ap.add_argument("--backfill", metavar="FILE", help="Load a whole log file into the stats database (no Discord posts), then exit")
     ap.add_argument("--render-site", action="store_true", help="Render the stats web page from the database once and exit")
     ap.add_argument("--refresh-steam", action="store_true", help="Fetch Steam achievements for known players once, then exit")
+    ap.add_argument("--health-check", action="store_true",
+                    help="Read-only: show the server's up/down verdict from the API and the log, then exit")
     ap.add_argument("--maintenance-check", action="store_true",
                     help="Read-only: verify the LOW.MS API key, list backups, show update status, then exit")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -1034,6 +1086,32 @@ def main():
         return
 
     source = build_source(cfg)
+    if args.health_check:
+        store_ = open_store() if db_enabled else None
+        parser_ = ValheimLogParser()
+        try:   # seed the newest log timestamp from one window so freshness is meaningful
+            if hasattr(source, "fetch_lines"):
+                lines = source.fetch_lines()
+            elif hasattr(source, "path"):          # file source: read the tail, touching no state
+                with open(source.path, encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()[-500:]
+            else:
+                lines = []
+                print("(this source can't be sampled without disturbing the monitor's read "
+                      "offset; freshness is unavailable here)")
+            for line in lines:
+                list(parser_.feed(line))
+        except Exception as e:  # noqa: BLE001
+            print(f"(could not read the log: {e})")
+        h = build_health({**cfg, "health": {**(cfg.get("health") or {}), "enabled": True}},
+                         build_maintenance(cfg, source, discord, server_name), discord,
+                         server_name, parser_, store_)
+        for line in h.report():
+            print(line)
+        if store_:
+            store_.close()
+        return
+
     if args.maintenance_check:
         mnt = build_maintenance(cfg, source, discord, server_name)
         if not mnt:
@@ -1107,6 +1185,10 @@ def main():
             log.warning("Steam refresh failed: %s", e)
 
     maint = build_maintenance(cfg, source, discord, server_name)
+    hc = build_health(cfg, maint, discord, server_name, parser, store)
+    if hc:
+        log.info("Health checks on: every %.0f min, alert after %d bad check(s); log stale after %.0f min",
+                 hc.interval / 60, hc.confirm, hc.log_stale / 60)
     if maint:
         log.info("Maintenance on: checks every %.0f min when empty; backup window %s %s; updates %s%s",
                  maint.interval / 60, (cfg.get("maintenance") or {}).get("backup", {}).get("window", "02:00-06:00"),
@@ -1139,7 +1221,13 @@ def main():
                             log.warning("DB write failed for %s: %s", ev.kind, e)
                     if maint:
                         maint.observe(ev, len(parser.s.online))
-                    if not (maint and maint.suppressing(ev.kind)):
+                    if hc:
+                        hc.observe(ev)
+                    # While health is watching, it owns outage messaging: its alerts carry
+                    # the reason and the downtime, so the log-derived pair would duplicate.
+                    muted = (hc is not None and (ev.kind == "server_offline"
+                                                 or (ev.kind == "server_online" and hc.absorbing_online())))
+                    if not muted and not (maint and maint.suppressing(ev.kind)):
                         discord.post(ev, server_name, events)
                     # Track down/up so we can tell a lingering outage from a quick restart.
                     if ev.kind == "server_restart":
@@ -1156,6 +1244,7 @@ def main():
             # Our own maintenance can legitimately keep it down past the grace period: hold
             # the alert (don't drop it) until the maintenance quiet period is over.
             if (down_since and not offline_posted and now - down_since > offline_grace
+                    and hc is None
                     and not (maint and maint.suppressing("server_offline"))):
                 discord.post(Event("server_offline", None, {}), server_name, events)
                 offline_posted = True
@@ -1171,6 +1260,11 @@ def main():
                     maint.tick()
                 except Exception as e:
                     log.warning("Maintenance check failed: %s", e)
+            if hc:
+                try:
+                    hc.tick()
+                except Exception as e:
+                    log.warning("Health check failed: %s", e)
         except KeyboardInterrupt:
             log.info("Stopping")
             if store:

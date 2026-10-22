@@ -328,6 +328,41 @@ Setup:
 5. Turn **off** LOW.MS's own *Update* / *Backup* scheduled tasks (Settings →
    Scheduled tasks), which run whether or not anyone is online.
 
+## Outage alerts (is the server actually up?)
+
+The log-based detector only notices a **graceful** stop: Valheim writes
+`OnApplicationQuit` / `ZNet Shutdown` and the monitor posts "restarting". When the
+host node dies, nothing is written at all — the log just stops — so that detector
+stays silent for the whole outage. The `health` block watches from the outside:
+
+```json
+"health": { "enabled": true, "check_interval_seconds": 300, "confirm_checks": 2 }
+```
+
+Every 5 minutes it combines two independent signals, because neither is reliable alone:
+
+| | log fresh | log stale (> `log_stale_seconds`, 25 min) |
+|---|---|---|
+| **API says down** | up (only if a line arrived in the last 2 min) → otherwise **DOWN** | **DOWN** |
+| **API says up** | up | **DOWN** — hung server, or a stalled log feed |
+| **API unusable** | up | **DOWN** |
+
+`GET /v1/servers/{id}` needs the **`servers:read`** scope. Without it the check still
+works from log freshness alone (Valheim writes `Connections N ZDOS` every 10 minutes
+even with nobody playing), it just loses the faster signal — it warns once and carries on.
+
+It alerts after `confirm_checks` bad checks in a row (2 → about 10 minutes), so a
+routine restart doesn't trigger it, and it stays silent while the monitor's own
+backup/update has the server stopped. Discord gets one message when it goes down,
+naming the reason, and one when it returns, with the downtime. While health is on it
+owns those alerts, so the log-derived "offline"/"back online" pair doesn't duplicate
+them. A fresh boot line recovers immediately rather than waiting for the next check.
+
+Check it by hand (read-only):
+```bash
+python3 valheim_discord_monitor.py --config config.json --health-check
+```
+
 ## Running it permanently
 
 **Docker**
@@ -379,6 +414,11 @@ or run it in a terminal.
 | `maintenance.update.check_interval_seconds` | 3600 | How often to ask whether an update is waiting (runs even with players online). |
 | `maintenance.update.empty_settle_seconds` | 180 | Continuous emptiness required before installing. |
 | `maintenance.update.retry_cooldown_seconds` | 3600 | Wait this long after a failed update before retrying. |
+| `health.enabled` | false | Outside-in up/down monitoring + Discord outage alerts. |
+| `health.check_interval_seconds` | 300 | How often to check. |
+| `health.confirm_checks` | 2 | Bad checks in a row before alerting. |
+| `health.log_stale_seconds` | 1500 | Log silence that counts as down (Valheim writes every 10 min). |
+| `health.log_fresh_override_seconds` | 120 | A line this recent overrides an API "down". |
 | `maintenance.panel_login` | — | Panel email/password for updates when the source has no session (e.g. `lowms`); or `NEXUS_EMAIL` / `NEXUS_PASSWORD`. |
 | `maintenance.dry_run` | false | Log the plan without doing anything. |
 | `discord.embeds` | true | Coloured embed vs plain text. |

@@ -70,6 +70,14 @@
       "password": "your-panel-password  (or NEXUS_PASSWORD env)"
     }
   },
+  "health": {
+    "enabled": true,
+    "check_interval_seconds": 300,
+    "confirm_checks": 2,
+    "log_stale_seconds": 1500,
+    "notify": true,
+    "state_file": "health_state.json"
+  },
   "source": {
     "type": "a2s",
     "host": "YOUR.SERVER.IP",
