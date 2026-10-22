@@ -22,15 +22,17 @@ class Api:
 class Ev:
     def __init__(self, kind): self.kind = kind
 
-def make(status="running", age=60.0, raises=None, cfg=None, suppress=False):
+def make(status="running", age=60.0, raises=None, cfg=None, suppress=False,
+         feed=(None, None)):
     fd, path = tempfile.mkstemp(suffix=".json"); os.close(fd); os.unlink(path)
     clk = Clock(); notes = []
-    state = {"age": age}
+    state = {"age": age, "feed": feed}
     h = H.ServerHealth({"check_interval_seconds": 300, "confirm_checks": 2,
                         "log_stale_seconds": 1500, **(cfg or {})},
                        Api(status, raises), lambda: state["age"],
                        lambda k, d: notes.append((k, d)),
-                       (lambda: suppress), clock=clk, state_path=path)
+                       (lambda: suppress), clock=clk, state_path=path,
+                       feed_status=lambda: state["feed"])
     return h, clk, notes, state, path
 
 def tick(h, clk, n=1, step=300):
@@ -162,6 +164,46 @@ h, clk, notes, st, _ = make(status="running", age=60)
 tick(h, clk)                      # first check runs
 clk.adv(60)                       # ...then a tick inside the interval is a no-op
 ck("ticks inside the interval are free", h.tick() is None)
+
+
+# ============ the live 2026-10-22 case: restarted mid-outage, console 502 ============
+print()
+# API says 'active' (a service-level word, not runtime), log never readable at all.
+ck("classify('active') -> up", H.classify("active") == "up")
+h, clk, notes, st, _ = make(status="active", age=None, feed=(None, None))
+st["age"] = None
+r = tick(h, clk)
+ck("fresh start, no log yet -> not down immediately", not notes, (r, notes))
+clk.adv(1300)                                   # 20+ min with still no log line
+r = tick(h, clk); r = tick(h, clk)
+ck("never able to read the log -> ALERTS instead of claiming health",
+   [k for k, _ in notes] == ["server_down"], (r, notes))
+ck("  ...and says it can't read the log", "no log line read" in notes[0][1], notes[0][1])
+
+# with the feed openly erroring, it doesn't wait the full 25-minute window
+h, clk, notes, st, _ = make(status="active", age=None,
+                            feed=(None, "LOW.MS console 502 daemon_unavailable"))
+st["age"] = None
+clk.adv(620)                                    # past feed_error_grace (10 min), not log_stale
+tick(h, clk); r = tick(h, clk)
+ck("a 502 feed error alerts after ~10 min, not 25", [k for k, _ in notes] == ["server_down"], (r, notes))
+ck("  ...and quotes the feed error", "daemon_unavailable" in notes[0][1], notes[0][1])
+ck("  ...wording points at the log, not a guess", "can't read the server's log" in notes[0][1], notes[0][1])
+
+# feed recovers -> back up
+st["feed"] = (0.0, None); st["age"] = 20
+r = tick(h, clk)
+ck("feed recovers -> posts recovery", [k for k, _ in notes] == ["server_down", "server_recovered"], notes)
+
+# a healthy server whose feed blipped once is not an outage
+h, clk, notes, st, _ = make(status="active", age=30, feed=(30.0, None))
+tick(h, clk, n=4)
+ck("healthy feed + fresh log -> never alerts", notes == [], notes)
+
+# feed error but the log is still fresh (cached window) -> trust the log
+h, clk, notes, st, _ = make(status="active", age=60, feed=(60.0, "502 daemon_unavailable"))
+tick(h, clk, n=3)
+ck("transient feed error with a fresh log -> no alert", notes == [], notes)
 
 # ---------------------------------------------------------------- report
 h, clk, notes, st, _ = make(status="offline", age=3000)

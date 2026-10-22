@@ -901,7 +901,8 @@ def build_maintenance(cfg: dict, source, discord: "Discord", server_name: str):
     return maintenance.Maintenance(m, maintenance.PublicAPI(key, server_id, base), panel, notify)
 
 
-def build_health(cfg: dict, maint, discord: "Discord", server_name: str, parser, store):
+def build_health(cfg: dict, maint, discord: "Discord", server_name: str, parser, store,
+                 feed_status=lambda: (None, None)):
     """Outside-in up/down monitoring (health.py). None when disabled."""
     h = cfg.get("health") or {}
     if not h.get("enabled", False):
@@ -943,7 +944,8 @@ def build_health(cfg: dict, maint, discord: "Discord", server_name: str, parser,
     suppress = (lambda: bool(maint and (maint.active or maint.suppressing("server_offline")))) if maint \
         else (lambda: False)
     return health.ServerHealth(h, api, log_age, notify, suppress,
-                               state_path=h.get("state_file", "health_state.json"))
+                               state_path=h.get("state_file", "health_state.json"),
+                               feed_status=feed_status)
 
 
 def record_event(store, ev: "Event") -> None:
@@ -1089,6 +1091,7 @@ def main():
     if args.health_check:
         store_ = open_store() if db_enabled else None
         parser_ = ValheimLogParser()
+        feed_err = {"e": None}
         try:   # seed the newest log timestamp from one window so freshness is meaningful
             if hasattr(source, "fetch_lines"):
                 lines = source.fetch_lines()
@@ -1102,10 +1105,12 @@ def main():
             for line in lines:
                 list(parser_.feed(line))
         except Exception as e:  # noqa: BLE001
+            feed_err["e"] = str(e)[:140]
             print(f"(could not read the log: {e})")
         h = build_health({**cfg, "health": {**(cfg.get("health") or {}), "enabled": True}},
                          build_maintenance(cfg, source, discord, server_name), discord,
-                         server_name, parser_, store_)
+                         server_name, parser_, store_,
+                         feed_status=lambda: (None, feed_err["e"]))
         for line in h.report():
             print(line)
         if store_:
@@ -1185,7 +1190,12 @@ def main():
             log.warning("Steam refresh failed: %s", e)
 
     maint = build_maintenance(cfg, source, discord, server_name)
-    hc = build_health(cfg, maint, discord, server_name, parser, store)
+    # The log feed's own health is a signal: if we cannot read the log at all, the
+    # server (or its node) is very likely down -- see health.silence().
+    feed = {"ok_at": None, "err": None}
+    hc = build_health(cfg, maint, discord, server_name, parser, store,
+                      feed_status=lambda: (None if feed["ok_at"] is None else time.time() - feed["ok_at"],
+                                           feed["err"]))
     if hc:
         log.info("Health checks on: every %.0f min, alert after %d bad check(s); log stale after %.0f min",
                  hc.interval / 60, hc.confirm, hc.log_stale / 60)
@@ -1234,6 +1244,7 @@ def main():
                         down_since, offline_posted = time.time(), False
                     elif ev.kind in ("server_online", "login"):
                         down_since = None
+            feed["ok_at"], feed["err"] = time.time(), None
             backoff = interval
             now = time.time()
             if store and changed and parser.last_ts is not None:
@@ -1271,6 +1282,12 @@ def main():
                 store.close()
             return
         except Exception as e:
+            feed["err"] = str(e)[:140]
+            if hc:   # keep checking while the feed is broken -- that IS the symptom
+                try:
+                    hc.tick()
+                except Exception as he:  # noqa: BLE001
+                    log.debug("health tick failed: %s", he)
             log.warning("Poll failed: %s (retrying in %.0fs)", e, backoff)
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)

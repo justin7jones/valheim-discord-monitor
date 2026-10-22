@@ -76,9 +76,14 @@ def human(seconds: float) -> str:
 class ServerHealth:
     def __init__(self, cfg: dict, api, log_age: Callable[[], Optional[float]],
                  notify: Callable[[str, str], None], suppress: Callable[[], bool] = lambda: False,
-                 clock: Callable[[], float] = time.time, state_path: Optional[str] = None):
+                 clock: Callable[[], float] = time.time, state_path: Optional[str] = None,
+                 feed_status: Callable[[], tuple] = lambda: (None, None)):
         self.api = api                      # maintenance.PublicAPI or None
         self.log_age = log_age              # seconds since the newest log line, or None
+        # () -> (seconds since the last SUCCESSFUL log read or None, last error or None).
+        # Without this, a monitor restarted mid-outage has no log timestamp at all and
+        # would look healthy forever while the log feed kept failing.
+        self.feed_status = feed_status
         self.notify, self.suppress = notify, suppress
         self.clock = clock
         self.interval = float(cfg.get("check_interval_seconds", 300))
@@ -88,6 +93,10 @@ class ServerHealth:
         # writes every ~10 min, so anything older cannot distinguish "alive" from
         # "died 5 minutes ago", and we would rather alert than miss an outage.
         self.fresh_override = float(cfg.get("log_fresh_override_seconds", 120))
+        # When the log feed is openly erroring (e.g. 502 daemon_unavailable) we don't wait
+        # the full log_stale window -- that error is itself evidence.
+        self.feed_error_grace = float(cfg.get("feed_error_grace_seconds", 600))
+        self.started = clock()
         self.state_path = Path(state_path or cfg.get("state_file", "health_state.json"))
         self.last_check = 0.0
         self.bad_streak = 0
@@ -132,12 +141,30 @@ class ServerHealth:
             log.info("Health: unrecognised LOW.MS status %r — relying on the log instead", raw)
         return verdict, f"LOW.MS reports '{raw}'" if raw else "LOW.MS reported no status"
 
+    def silence(self) -> tuple[float, str, Optional[str]]:
+        """-> (seconds of silence from the server, wording, feed error if any).
+
+        Normally the age of the newest log line. If we have never managed to read one
+        (a monitor restarted during an outage, or a failing console endpoint), measure
+        from the last successful read, or from start-up -- otherwise an unreadable log
+        would read as "no news is good news" indefinitely.
+        """
+        age = self.log_age()
+        ok_age, err = self.feed_status()
+        if age is not None:
+            return age, f"log last wrote {human(age)} ago", err
+        quiet = ok_age if ok_age is not None else max(0.0, self.clock() - self.started)
+        txt = f"no log line read in {human(quiet)}"
+        return quiet, txt + (f" (feed error: {err})" if err else ""), err
+
     def assess(self) -> tuple[bool, str]:
         """-> (is_down, human-readable detail)."""
         verdict, detail = self.api_status()
         age = self.log_age()
-        fresh = age is not None and age <= self.log_stale
-        age_txt = "no log timestamp yet" if age is None else f"log last wrote {human(age)} ago"
+        quiet, age_txt, err = self.silence()
+        # An openly failing feed is evidence in itself, so don't wait the full window.
+        limit = min(self.log_stale, self.feed_error_grace) if err else self.log_stale
+        fresh = quiet <= limit
 
         if verdict == "down":
             if age is not None and age <= self.fresh_override:
@@ -145,12 +172,15 @@ class ServerHealth:
                 log.info("Health: %s but %s — treating as up", detail, age_txt)
                 return False, f"{detail}, but {age_txt}"
             return True, f"{detail}; {age_txt}"
-        if not fresh and age is not None:
-            why = "the server is not writing to its log" if verdict == "up" else detail
+        if not fresh:
+            if err:
+                why = "can't read the server's log"
+            elif verdict == "up":
+                why = "the server is not writing to its log"
+            else:
+                why = detail
             return True, f"{why}; {age_txt}"
-        if verdict == "up":
-            return False, f"{detail}; {age_txt}"
-        return False, f"{detail}; {age_txt}"      # nothing says it's down
+        return False, f"{detail}; {age_txt}"
 
     # -- loop ----------------------------------------------------------------
     def observe(self, ev) -> None:
@@ -206,10 +236,11 @@ class ServerHealth:
     def report(self) -> list[str]:
         verdict, detail = self.api_status()
         age = self.log_age()
+        quiet, age_txt, err = self.silence()
         down, why = self.assess()
         return [
             f"API status   : {detail} -> {verdict}",
-            f"Log freshness: " + ("no timestamp yet" if age is None
+            f"Log freshness: " + (age_txt if age is None
                                   else f"{human(age)} ago (stale after {human(self.log_stale)})"),
             f"Verdict      : {'DOWN' if down else 'UP'} — {why}",
             f"Alerting     : every {human(self.interval)}, after {self.confirm} bad check(s) in a row"

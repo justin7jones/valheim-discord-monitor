@@ -341,11 +341,22 @@ stays silent for the whole outage. The `health` block watches from the outside:
 
 Every 5 minutes it combines two independent signals, because neither is reliable alone:
 
-| | log fresh | log stale (> `log_stale_seconds`, 25 min) |
+| | log fresh | silent too long (> `log_stale_seconds`, 25 min) |
 |---|---|---|
 | **API says down** | up (only if a line arrived in the last 2 min) → otherwise **DOWN** | **DOWN** |
-| **API says up** | up | **DOWN** — hung server, or a stalled log feed |
+| **API says up** | up | **DOWN** — hung server, or a log we can't read |
 | **API unusable** | up | **DOWN** |
+
+"Silent" is the age of the newest log line — or, if we have never managed to read one
+(a monitor restarted during an outage, a console endpoint returning
+`502 daemon_unavailable`), the time since the last successful read, or since start-up.
+Without that, an unreadable log would read as "no news is good news" forever. When the
+feed is openly erroring the threshold drops to `feed_error_grace_seconds` (10 min),
+since the error is itself evidence, and the alert quotes it.
+
+Note that LOW.MS's `status` looks service-level rather than runtime — a live server
+reports `active` — so log silence does most of the real work; the API mainly adds a
+faster signal when it does say something is wrong.
 
 `GET /v1/servers/{id}` needs the **`servers:read`** scope. Without it the check still
 works from log freshness alone (Valheim writes `Connections N ZDOS` every 10 minutes
@@ -419,6 +430,7 @@ or run it in a terminal.
 | `health.confirm_checks` | 2 | Bad checks in a row before alerting. |
 | `health.log_stale_seconds` | 1500 | Log silence that counts as down (Valheim writes every 10 min). |
 | `health.log_fresh_override_seconds` | 120 | A line this recent overrides an API "down". |
+| `health.feed_error_grace_seconds` | 600 | Silence allowed while the log feed is erroring outright. |
 | `maintenance.panel_login` | — | Panel email/password for updates when the source has no session (e.g. `lowms`); or `NEXUS_EMAIL` / `NEXUS_PASSWORD`. |
 | `maintenance.dry_run` | false | Log the plan without doing anything. |
 | `discord.embeds` | true | Coloured embed vs plain text. |
