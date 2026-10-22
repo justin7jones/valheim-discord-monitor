@@ -920,17 +920,24 @@ def build_health(cfg: dict, maint, discord: "Discord", server_name: str, parser,
             log.info("Health: no LOW.MS API key/server_id; using log freshness alone")
 
     def log_age():
-        """Seconds since the newest log line. Log timestamps are the game server's wall
-        clock stored as if UTC, so subtract the offset the monitor records."""
-        if parser.last_ts is None:
-            return None
-        offset = 0
+        """Seconds since the newest log line we know of.
+
+        Prefers what this process has parsed, but falls back to the last event recorded
+        in the database. That matters after a restart during an outage: without it the
+        process has no timestamp at all and has to measure silence from its own start,
+        which understates a server that has been quiet for hours."""
+        offset, newest = 0, parser.last_ts
         if store is not None:
             try:
                 offset = int(store.get_meta("log_clock_offset") or 0)
+                if newest is None:
+                    recorded = store.get_meta("last_event_at")
+                    newest = int(recorded) if recorded else None
             except Exception:  # noqa: BLE001
-                offset = 0
-        return max(0.0, (time.time() - offset) - parser.last_ts)
+                pass
+        if newest is None:
+            return None
+        return max(0.0, (time.time() - offset) - newest)
 
     def notify(kind: str, detail: str):
         log.info("HEALTH %s: %s", kind, detail)

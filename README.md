@@ -354,9 +354,15 @@ Without that, an unreadable log would read as "no news is good news" forever. Wh
 feed is openly erroring the threshold drops to `feed_error_grace_seconds` (10 min),
 since the error is itself evidence, and the alert quotes it.
 
-Note that LOW.MS's `status` looks service-level rather than runtime — a live server
-reports `active` — so log silence does most of the real work; the API mainly adds a
-faster signal when it does say something is wrong.
+Observed `status` values: `active` while healthy, `failed` during a node outage. It is
+runtime-meaningful but can **lag** — during one outage it still read `active` while the
+console was already returning `502 daemon_unavailable` — which is why log silence is
+weighted equally rather than treated as a tiebreaker.
+
+After a restart the process has parsed nothing yet, so "silence" falls back to the newest
+event recorded in the stats database (and only then to start-up time). Without that, a
+monitor restarted three hours into an outage would measure silence from its own launch and
+look healthy.
 
 `GET /v1/servers/{id}` needs the **`servers:read`** scope. Without it the check still
 works from log freshness alone (Valheim writes `Connections N ZDOS` every 10 minutes
