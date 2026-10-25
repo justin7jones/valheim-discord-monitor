@@ -78,6 +78,13 @@ Vanilla Valheim already prints everything needed to `valheim_console.log`
 The monitor tails the log (by byte offset, so restarts never re-post), runs the
 lines through a small state machine, and posts an embed to a Discord webhook.
 
+**Player count in the footer.** The server's own count is authoritative but stale when
+it matters: a crossplay server never writes `Player joined … now N player(s)`, so the
+only count line is `Connections N ZDOS` every 10 minutes, which still holds the
+pre-join value when someone logs in. The footer therefore reports the larger of that
+count and the players being tracked — correct the instant someone joins, while still
+counting players who were already online before the monitor started.
+
 ### Setup
 
 1. **Discord webhook** — in your Discord server: channel → Edit Channel →

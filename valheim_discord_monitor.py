@@ -127,7 +127,23 @@ class ValheimLogParser:
         self.last_ts: Optional[int] = None      # epoch of the most recent timestamped log line
 
     def _count(self) -> dict:
-        return {"count": self.s.server_count} if self.s.server_count is not None else {}
+        """Players online, for the message footer.
+
+        The server's own count is authoritative but can be badly out of date at the
+        moment it matters most. On a crossplay server the game never writes
+        "Player joined ... now N player(s)" -- the only count line is
+        "Connections N ZDOS", written every 10 minutes -- so when someone logs in it
+        still holds the PRE-JOIN value, and a lone player arriving was announced as
+        "0 player(s) online". Report the larger of that count and the players we are
+        actually tracking: the tracked set is right the instant someone joins, while
+        the server's count covers players who were already on before the monitor
+        started (which we never saw log in)."""
+        tracked = len(self.s.online)
+        if self.s.server_count is None:
+            # Just after a restart we have no authoritative count yet; our own
+            # tracking still beats showing no count at all.
+            return {"count": tracked} if tracked else {}
+        return {"count": max(self.s.server_count, tracked)}
 
     def feed(self, line: str) -> Iterator["Event"]:
         """Parse one line, stamping each emitted event with the log timestamp (epoch)."""
